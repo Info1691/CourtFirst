@@ -34,20 +34,35 @@ class CaseRow:
     jurisdiction: str | None = None
 
 def read_cases_csv(path: str = CASES_CSV) -> list[CaseRow]:
+    """
+    Accepts either a `source_url` column or a `url` column.
+    Only `case_id` and one of {source_url|url} are required.
+    Optional columns: title, local_text, jurisdiction.
+    """
     rows: list[CaseRow] = []
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        # We accept extra columns; just require these keys:
-        required = {"case_id", "source_url"}
-        missing = required - set(reader.fieldnames or [])
-        if missing:
-            raise ValueError(f"cases.csv missing required columns: {sorted(missing)}")
+        headers = set(reader.fieldnames or [])
+        if "case_id" not in headers:
+            raise ValueError("cases.csv missing required column: 'case_id'")
+        if not (("source_url" in headers) or ("url" in headers)):
+            raise ValueError("cases.csv must include either 'source_url' or 'url' column")
+
         for r in reader:
+            case_id = (r.get("case_id") or "").strip()
+            if not case_id:
+                # skip blank rows silently
+                continue
+            source_url = (r.get("source_url") or r.get("url") or "").strip()
+            if not source_url and not (r.get("local_text") or "").strip():
+                # need *either* a fetchable URL or inline text
+                raise ValueError(f"Row for case_id='{case_id}' has neither source_url/url nor local_text")
+
             rows.append(
                 CaseRow(
-                    case_id=(r.get("case_id") or "").strip(),
-                    title=(r.get("title") or r.get("case_id") or "").strip(),
-                    source_url=(r.get("source_url") or r.get("url") or "").strip(),
+                    case_id=case_id,
+                    title=(r.get("title") or case_id).strip(),
+                    source_url=source_url,
                     local_text=(r.get("local_text") or "").strip() or None,
                     jurisdiction=(r.get("jurisdiction") or "").strip() or None,
                 )
@@ -68,10 +83,8 @@ def fetch_html(url: str, timeout: int = 30) -> str:
 
 def extract_readable_text(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
-    # Drop scripts/styles/navs
     for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
         tag.decompose()
-    # Heuristic: prefer article/main; fall back to body
     main = soup.find(["article", "main"]) or soup.body
     text = main.get_text("\n") if main else soup.get_text("\n")
     return normalize_ws(text)
@@ -100,6 +113,5 @@ def append_jsonl(obj: t.Any, path: str) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-# polite rate-limiting
 def sleep_ms(ms: int) -> None:
     time.sleep(ms / 1000.0)
