@@ -1,23 +1,23 @@
 # CourtFirst
 
-Court-first extraction of breach-related findings straight from judgments (e.g., Jersey Law / BAILII).
-Outputs:
-- `out/breach_candidates.json` – mined phrases + paragraph-level provenance
-- `out/breaches.json` – Breach-ui ready, grouped by tag, **no hard-coded terms**
+Proof-of-concept pipeline that:
+1. Reads `data/cases.csv`
+2. Scrapes public case pages (or uses `local_text`)
+3. Builds breach candidates by scanning text for breach-like phrases
+4. Exports `out/breaches.json` in **Breach-ui** schema with provenance
 
-Run via GitHub Actions (see `.github/workflows/scrape.yml`).
+## Data
 
-## How it works
-1. Read `data/cases.csv` URLs (you control which cases to include).
-2. Fetch the judgment HTML (polite, cached).
-3. Parse paragraphs, focus on *outcome zones* (Held/Conclusion/Order) and sentences with “held/found/ordered/liable”.
-4. Mine what the **court says** (e.g., “breach of duty”, “failure to account”), skipping explicit negatives (e.g., “no breach”).
-5. Emit JSON with provenance (case id, paragraph id, snippet).
+`data/cases.csv` must have these columns:
 
-## Quick start
-- Add more rows in `data/cases.csv`.
-- Run the **Scrape judgments → breaches.json** workflow.
-- Download the **artifacts** from Actions to review. (Optional) Enable the PR step to update `Breach-ui`.
+- `case_id` (required)
+- `source_url` (required unless `local_text` provided)
+- `title` (optional, defaults to `case_id`)
+- `local_text` (optional: if supplied, avoids scraping)
+- `jurisdiction` (optional)
 
-## Legal
-Respect robots.txt and terms of use of target sites. Use official/public sources that allow reuse.
+Example:
+
+```csv
+case_id,title,source_url,local_text,jurisdiction
+JRC_2019_037,"Zhang v DBS Trustee",https://www.jerseylaw.je/judgments/unreported/pages/uid9a0fa2c3c9f8.aspx,,Jersey
