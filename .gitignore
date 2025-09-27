@@ -1,4 +1,11 @@
-.cache/
-out/
-*.pyc
+# outputs
+/out/*
+!out/.gitkeep
+
+# python
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
