@@ -1,84 +1,47 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-parse_metadata.py
-Input : out/html/*.html
-Output: out/metadata.json  [{case_id, title?, court?, date?, citation?}]
-Rules:
-- Parse only what's present.
-- Never synthesize values.
+Ultra-conservative metadata parser.
+- Extracts <title> and first <h1>, if present.
+- Writes a JSON list; no invented content.
 """
 
-import os
+import argparse
 import re
-from typing import Dict, Any, List, Optional
+from pathlib import Path
+from tools.util import save_json
 
-from tools.util import repo_root, save_json
+TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
+H1_RE = re.compile(rb"<h1[^>]*>(.*?)</h1>", re.I | re.S)
 
-HTML_DIR = os.path.join(repo_root(), "out", "html")
-OUT_JSON = os.path.join(repo_root(), "out", "metadata.json")
+def textify(b: bytes) -> str:
+    t = re.sub(rb"<[^>]+>", b"", b or b"", flags=re.S)
+    return (t.decode("utf-8", "ignore")).strip()
 
+def extract_bits(html: bytes):
+    title = textify(TITLE_RE.search(html).group(1)) if TITLE_RE.search(html) else ""
+    h1 = textify(H1_RE.search(html).group(1)) if H1_RE.search(html) else ""
+    return {"title": title, "h1": h1}
 
-def read_file(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--html", dest="html_dir", required=True)
+    p.add_argument("--out", dest="out_json", required=True)
+    return p.parse_args()
 
-
-def pick(patterns: List[re.Pattern], text: str) -> Optional[str]:
-    for p in patterns:
-        m = p.search(text)
-        if m:
-            return m.group(1).strip()
-    return None
-
-
-def main() -> None:
-    items: List[Dict[str, Any]] = []
-
-    if not os.path.isdir(HTML_DIR):
-        print(f"No HTML folder at {HTML_DIR}")
-        save_json(OUT_JSON, items)
-        return
-
-    files = [f for f in os.listdir(HTML_DIR) if f.lower().endswith(".html")]
-    for f in files:
-        case_id = os.path.splitext(f)[0]
-        html = read_file(os.path.join(HTML_DIR, f))
-
-        # Try to find a title (very conservative)
-        title = pick([
-            re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL),
-            re.compile(r'<meta\s+name=["\']citation_title["\']\s+content=["\'](.*?)["\']', re.IGNORECASE),
-        ], html)
-
-        # Try court
-        court = pick([
-            re.compile(r'<meta\s+name=["\']citation_journal_title["\']\s+content=["\'](.*?)["\']', re.IGNORECASE),
-            re.compile(r'<meta\s+name=["\']DC.title["\']\s+content=["\'](.*?)["\']', re.IGNORECASE),
-        ], html)
-
-        # Try date
-        date = pick([
-            re.compile(r'<meta\s+name=["\']citation_date["\']\s+content=["\'](.*?)["\']', re.IGNORECASE),
-            re.compile(r'<meta\s+name=["\']DC.date["\']\s+content=["\'](.*?)["\']', re.IGNORECASE),
-        ], html)
-
-        # Try neutral citation
-        citation = pick([
-            re.compile(r'<meta\s+name=["\']citation_reference["\']\s+content=["\'](.*?)["\']', re.IGNORECASE),
-            re.compile(r'\[20\d{2}\]\s+[A-Z]{2,}.*?\d+', re.IGNORECASE),  # very generic fallback; only if found
-        ], html)
-
-        record: Dict[str, Any] = {"case_id": case_id}
-        if title:   record["title"] = title
-        if court:   record["court"] = court
-        if date:    record["date"] = date
-        if citation:record["citation"] = citation
-
-        items.append(record)
-
-    save_json(OUT_JSON, items)
-    print(f"Wrote {len(items)} metadata rows -> {OUT_JSON}")
-
+def main():
+    args = parse_args()
+    html_dir = Path(args.html_dir)
+    items = []
+    for f in sorted(html_dir.glob("*.html")):
+        try:
+            bits = extract_bits(f.read_bytes())
+            items.append({"file": f.name, **bits})
+        except Exception as e:
+            items.append({"file": f.name, "error": str(e)})
+    save_json(args.out_json, items)
+    print(f"Wrote metadata for {len(items)} files -> {args.out_json}")
 
 if __name__ == "__main__":
     main()
