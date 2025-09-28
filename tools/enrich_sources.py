@@ -2,46 +2,58 @@
 # -*- coding: utf-8 -*-
 
 """
-Pass-through URL enricher.
+Pass-through URL normaliser.
 
-- Reads an input CSV of cases (any header style).
-- Accepts 'url' OR 'source_url' (or link/href), normalizes to 'source_url'.
-- Writes OUT/cases_with_urls.csv with a guaranteed 'source_url' column.
-- Also writes OUT/urls.json for debugging/inspection.
+Input CSV (UTF-8) at --in must contain:
+  - case_id
+  - url   (the original source URL; we do NOT invent anything)
 
-No guessing, no fabrication: if there is no URL, the cell stays blank.
+Output:
+  out/cases_with_urls.csv  (case_id, source_url)
+  out/urls.json            (list of {case_id, source_url})
+
+We do not guess or fabricate. If a row lacks 'url', it is skipped and recorded.
 """
 
-import argparse
 from pathlib import Path
-from tools.util import read_cases_csv, write_cases_csv, save_json
+import argparse
+from typing import List, Dict
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--in", dest="in_csv", required=True, help="Path to input cases CSV")
-    p.add_argument("--outdir", dest="outdir", required=True, help="Output directory")
-    return p.parse_args()
+from tools.util import read_csv, write_csv, save_json, ensure_dir
 
 def main():
-    args = parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in", dest="in_csv", required=True, help="Input CSV with 'case_id' and 'url'")
+    ap.add_argument("--outdir", dest="outdir", required=True, help="Output folder")
+    args = ap.parse_args()
+
+    in_path = Path(args.in_csv)
     outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    ensure_dir(outdir)
 
-    cases = read_cases_csv(args.in_csv)
+    hmap, rows = read_csv(in_path)
+    miss = [k for k in ("case_id", "url") if k not in hmap]
+    if miss:
+        raise ValueError(f"Input CSV is missing required columns (case-insensitive): {miss}")
 
-    # make sure 'source_url' exists (copy from 'url' already handled in util.read_cases_csv)
-    for c in cases:
-        c.setdefault("source_url", c.get("url", ""))
+    out_rows: List[List[str]] = []
+    url_list: List[Dict[str, str]] = []
+    skipped: List[Dict[str, str]] = []
 
-    # Write normalized CSV
-    out_csv = outdir / "cases_with_urls.csv"
-    write_cases_csv(out_csv, cases)
+    for row in rows:
+        case_id = row[hmap["case_id"]].strip()
+        url = row[hmap["url"]].strip()
+        if not case_id:
+            continue
+        if not url:
+            skipped.append({"case_id": case_id, "reason": "no url"})
+            continue
+        out_rows.append([case_id, url])
+        url_list.append({"case_id": case_id, "source_url": url})
 
-    # Small JSON for quick auditing
-    urls = [{"case_id": c.get("case_id", ""), "source_url": c.get("source_url", "")} for c in cases]
-    save_json(outdir / "urls.json", urls)
-
-    print(f"Wrote {len(cases)} rows -> {out_csv}")
+    write_csv(["case_id", "source_url"], out_rows, outdir / "cases_with_urls.csv")
+    save_json(url_list, outdir / "urls.json")
+    save_json(skipped, outdir / "skipped.json")
 
 if __name__ == "__main__":
     main()
