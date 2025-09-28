@@ -2,53 +2,71 @@
 # -*- coding: utf-8 -*-
 
 """
-Fetch HTML for cases that have 'source_url'.
-Strictly copies what's online; no rewriting or invented text.
+Fetch HTML for each case source_url.
+
+Input:
+  --in  out/cases_with_urls.csv  (case_id, source_url)
+
+Outputs:
+  --html DIR/     (one .html per case; filename=case_id.html)
+  --report JSON   (exact HTTP results; no fabrication)
+
+We never invent content: we save exactly the server response text on 200;
+non-200 (or exceptions) are recorded in the report and that case is skipped.
 """
 
-import argparse
-import urllib.request
 from pathlib import Path
-from tools.util import read_cases_csv, sleep_jitter, safe_filename, save_json
+import argparse
+import requests
+from typing import Dict, Any
 
-UA = "Mozilla/5.0 (compatible; CourtFirstBot/0.1; +https://example.invalid/bot)"
-
-def http_get(url: str, timeout: int = 25) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--in", dest="in_csv", required=True, help="CSV from enrich_sources (cases_with_urls.csv)")
-    p.add_argument("--html", dest="html_dir", required=True, help="Directory to save raw HTML")
-    p.add_argument("--report", dest="report_json", required=True, help="Path to save fetch report JSON")
-    return p.parse_args()
+from tools.util import read_csv, ensure_dir, safe_filename, http_get, sleep_jitter, save_json
 
 def main():
-    args = parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in", dest="in_csv", required=True)
+    ap.add_argument("--html", dest="html_dir", required=True)
+    ap.add_argument("--report", dest="report_json", required=True)
+    args = ap.parse_args()
+
+    in_path = Path(args.in_csv)
     html_dir = Path(args.html_dir)
-    html_dir.mkdir(parents=True, exist_ok=True)
+    ensure_dir(html_dir)
+    report_path = Path(args.report_json)
 
-    cases = read_cases_csv(args.in_csv)
-    report = []
-    for c in cases:
-        cid = c.get("case_id", "").strip() or "unknown"
-        url = (c.get("source_url") or "").strip()
-        if not url:
-            report.append({"case_id": cid, "status": "skipped", "reason": "no_source_url"})
+    hmap, rows = read_csv(in_path)
+    if not {"case_id", "source_url"}.issubset(hmap.keys()):
+        raise ValueError("Input must have columns: case_id, source_url")
+
+    session = requests.Session()
+    results: Dict[str, Any] = {"ok": [], "failed": []}
+
+    for row in rows:
+        case_id = row[hmap["case_id"]].strip()
+        url = row[hmap["source_url"]].strip()
+        if not case_id or not url:
             continue
-        out_file = html_dir / f"{safe_filename(cid)}.html"
-        try:
-            data = http_get(url)
-            out_file.write_bytes(data)
-            report.append({"case_id": cid, "status": "ok", "bytes": len(data), "path": str(out_file), "url": url})
-        except Exception as e:
-            report.append({"case_id": cid, "status": "error", "error": str(e), "url": url})
-        sleep_jitter()
 
-    save_json(args.report_json, report)
-    print(f"Fetched {sum(1 for r in report if r['status']=='ok')} pages; report -> {args.report_json}")
+        rec = {"case_id": case_id, "url": url}
+        try:
+            status, text = http_get(url, session)
+            if status == 200 and text:
+                fname = safe_filename(f"{case_id}.html")
+                outp = html_dir / fname
+                with outp.open("w", encoding="utf-8", errors="ignore") as f:
+                    f.write(text)
+                rec.update({"status": status, "html_file": str(outp)})
+                results["ok"].append(rec)
+            else:
+                rec.update({"status": status, "error": "non-200 or empty body"})
+                results["failed"].append(rec)
+        except Exception as e:
+            rec.update({"status": None, "error": str(e)})
+            results["failed"].append(rec)
+
+        sleep_jitter(0.9)
+
+    save_json(results, report_path)
 
 if __name__ == "__main__":
     main()
