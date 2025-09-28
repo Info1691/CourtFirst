@@ -1,0 +1,75 @@
+name: Enrich cases with source URLs and outcomes
+
+on:
+  workflow_dispatch:
+    inputs:
+      auto_resolve:
+        description: "Try to auto-resolve first search result (true/false)"
+        required: true
+        default: "false"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out CourtFirst
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Add repo to PYTHONPATH
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+
+      # 1) Build search links and (optionally) auto-resolve to concrete URLs
+      - name: Build search links (+ optional auto-resolve)
+        run: |
+          python tools/resolve_urls.py \
+            --in data/cases.csv \
+            --outdir out \
+            --auto_resolve "${{ github.event.inputs.auto_resolve }}"
+
+      # 2) Fetch ONLY real URLs (explicit or resolved)
+      - name: Fetch HTML for cases
+        run: |
+          if [ -f out/resolved.csv ]; then IN=out/resolved.csv; else IN=out/cases_with_urls.csv; fi
+          python tools/fetch_cases.py \
+            --in "$IN" \
+            --html out/html \
+            --report out/fetch_report.json
+
+      # 3) Parse exact metadata + outcome-like snippets (from fetched HTML)
+      - name: Parse metadata
+        run: |
+          python tools/parse_metadata.py \
+            --html out/html \
+            --out out/metadata.json \
+            --report out/fetch_report.json
+
+      - name: Parse outcomes (snippets only; no fabrication)
+        run: |
+          python tools/parse_outcomes.py \
+            --html out/html \
+            --report out/fetch_report.json \
+            --out out/outcomes.json
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: enriched
+          path: |
+            out/search_links.csv
+            out/resolved.csv
+            out/resolve_log.json
+            out/cases_with_urls.csv
+            out/urls.json
+            out/skipped.json
+            out/fetch_report.json
+            out/metadata.json
+            out/outcomes.json
+            out/html/*.html
