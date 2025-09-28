@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Shared helpers for CourtFirst tools.
+Shared utilities. Strictly non-inventive:
+- Only returns what servers give us.
+- Saves exactly what we receive.
 """
 
-import json
 import os
-import random
+import json
 import time
-from typing import Any, Dict, Optional
+import random
+import pathlib
+from typing import Any, Optional, Dict
 
 import requests
 
@@ -23,19 +26,42 @@ def save_json(path: str, data: Any) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def sleep_jitter(lo: float = 0.5, hi: float = 1.25) -> None:
+def read_json(path: str) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def sleep_jitter(lo: float = 0.75, hi: float = 1.75) -> None:
+    """Jitter to be polite to servers."""
     time.sleep(random.uniform(lo, hi))
 
 
-def http_get(url: str, user_agent: str = "CourtFirstBot/1.0", timeout: int = 30) -> Optional[str]:
-    headers = {
-        "User-Agent": user_agent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    r = requests.get(url, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    # Only keep HTML-like responses
-    ctype = r.headers.get("Content-Type", "")
-    if "html" not in ctype.lower():
-        return r.text  # Still return; caller can decide
-    return r.text
+DEFAULT_UA = "CourtFirstBot/1.0 (+https://github.com/)"
+
+
+def http_get(url: str, timeout: int = 30, headers: Optional[Dict[str, str]] = None) -> requests.Response:
+    """
+    Do a GET and return the Response object so caller can use:
+      resp.status_code, resp.text, resp.url, resp.headers
+    Raises for HTTP errors.
+    """
+    _headers = {"User-Agent": DEFAULT_UA, "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"}
+    if headers:
+        _headers.update(headers)
+    resp = requests.get(url, headers=_headers, timeout=timeout, allow_redirects=True)
+    resp.raise_for_status()
+    return resp
+
+
+def safe_filename(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+
+
+def write_text(path: str, text: str) -> None:
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def repo_root() -> str:
+    return str(pathlib.Path(__file__).resolve().parents[1])
