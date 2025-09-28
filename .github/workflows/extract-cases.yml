@@ -5,22 +5,24 @@ on:
     inputs:
       start_line:
         description: "Start line (inclusive) in LTJ.lines.json"
-        required: false
+        required: true
         default: "1276"
       end_line:
         description: "End line (inclusive) in LTJ.lines.json"
-        required: false
+        required: true
         default: "3083"
       ltj_ref:
         description: "LTJ-ui ref (branch/tag/sha)"
-        required: false
+        required: true
         default: "main"
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+
     steps:
       - name: Check out CourtFirst
         uses: actions/checkout@v4
@@ -30,30 +32,52 @@ jobs:
         with:
           repository: Info1691/LTJ-ui
           ref: ${{ github.event.inputs.ltj_ref }}
-          token: ${{ secrets.LTJ_PAT }}
-          path: LTJ-ui
+          path: ltj-ui
+          token: ${{ secrets.LTJ_UI_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Extract cases (lines → CSV)
         run: |
-          python -m pip install --upgrade pip
-          pip install rapidfuzz
+          python - <<'PY'
+          import json, csv, os, re
+          START = int(os.environ["START"])
+          END   = int(os.environ["END"])
 
-      - name: Extract cases
-        run: |
-          mkdir -p out
-          python tools/extract_cases.py \
-            --lines LTJ-ui/out/LTJ.lines.json \
-            --start ${{ github.event.inputs.start_line }} \
-            --end   ${{ github.event.inputs.end_line }} \
-            --out   out/cases.csv
+          p = "ltj-ui/out/LTJ.lines.json"
+          with open(p, encoding="utf-8") as f:
+              data = json.load(f)
+
+          # LTJ.lines.json may be either {"lines":[{n,text},...]} or a flat list
+          lines = data["lines"] if isinstance(data, dict) and "lines" in data else data
+          slice_ = lines[START-1:END]
+
+          case_re = re.compile(r".+\b v\.? \b.+", flags=re.I)
+          rows = []
+          for ln in slice_:
+              text = ln["text"] if isinstance(ln, dict) and "text" in ln else str(ln)
+              n    = ln.get("n") if isinstance(ln, dict) else None
+              txt  = text.strip()
+              if case_re.search(txt):
+                  rows.append({"line": n, "case": txt})
+
+          os.makedirs("out", exist_ok=True)
+          out = "out/cases.csv"
+          with open(out, "w", newline="", encoding="utf-8") as f:
+              w = csv.DictWriter(f, fieldnames=["line","case"])
+              w.writeheader(); w.writerows(rows)
+          print(f"Wrote {len(rows)} rows to {out}")
+          PY
+        env:
+          START: ${{ github.event.inputs.start_line }}
+          END:   ${{ github.event.inputs.end_line }}
 
       - name: Upload artifact (cases.csv)
         uses: actions/upload-artifact@v4
         with:
-          name: cases_csv
+          name: ltj-cases
           path: out/cases.csv
+          if-no-files-found: error
