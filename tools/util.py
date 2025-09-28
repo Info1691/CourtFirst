@@ -1,67 +1,111 @@
 #!/usr/bin/env python3
-"""
-Shared utilities. Strictly non-inventive:
-- Only returns what servers give us.
-- Saves exactly what we receive.
-"""
+# -*- coding: utf-8 -*-
 
-import os
+import csv
 import json
-import time
+import os
 import random
-import pathlib
-from typing import Any, Optional, Dict
+import re
+import time
+from pathlib import Path
+from typing import Dict, List, Iterable
 
-import requests
+# ----------------------------
+# Small helpers
+# ----------------------------
 
+def slugify(s: str) -> str:
+    s = re.sub(r"\s+", " ", s or "").strip()
+    s = re.sub(r"[^\w\-\. ]+", "", s, flags=re.UNICODE)
+    s = s.replace(" ", "_")
+    return s[:200] or "untitled"
 
-def ensure_dir(path: str) -> None:
-    if path and not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
+def sleep_jitter(base: float = 0.8, spread: float = 0.6) -> None:
+    # polite throttle for scraping steps
+    time.sleep(max(0.0, base + random.uniform(0.0, spread)))
 
+def safe_filename(text: str) -> str:
+    return slugify(text)
 
-def save_json(path: str, data: Any) -> None:
-    ensure_dir(os.path.dirname(path))
+def save_json(path: os.PathLike, obj) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(obj, f, ensure_ascii=False, indent=2)
 
-
-def read_json(path: str) -> Any:
+def load_json(path: os.PathLike):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+# ----------------------------
+# CSV handling
+# ----------------------------
 
-def sleep_jitter(lo: float = 0.75, hi: float = 1.75) -> None:
-    """Jitter to be polite to servers."""
-    time.sleep(random.uniform(lo, hi))
+REQUIRED_CASE_KEYS = ["case_id"]  # we normalize URL columns below
 
+ALIASES = {
+    # normalize to "source_url"
+    "url": "source_url",
+    "link": "source_url",
+    "href": "source_url",
+}
 
-DEFAULT_UA = "CourtFirstBot/1.0 (+https://github.com/)"
+def _normalize_header(name: str) -> str:
+    return (name or "").strip().lower().replace("-", "_").replace(" ", "_")
 
-
-def http_get(url: str, timeout: int = 30, headers: Optional[Dict[str, str]] = None) -> requests.Response:
+def read_cases_csv(path: os.PathLike) -> List[Dict[str, str]]:
     """
-    Do a GET and return the Response object so caller can use:
-      resp.status_code, resp.text, resp.url, resp.headers
-    Raises for HTTP errors.
+    Reads a CSV of cases and normalizes headers.
+    - Accepts 'url' or 'source_url' (or 'link'/'href'); produces 'source_url'.
+    - Requires at least 'case_id' (case-insensitive).
     """
-    _headers = {"User-Agent": DEFAULT_UA, "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"}
-    if headers:
-        _headers.update(headers)
-    resp = requests.get(url, headers=_headers, timeout=timeout, allow_redirects=True)
-    resp.raise_for_status()
-    return resp
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"cases.csv not found: {path}")
 
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        raw_headers = reader.fieldnames or []
+        norm_headers = [_normalize_header(h) for h in raw_headers]
 
-def safe_filename(name: str) -> str:
-    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+        # map original -> normalized
+        header_map = dict(zip(raw_headers, norm_headers))
 
+        # build final headers with aliasing
+        final_headers = []
+        for h in norm_headers:
+            final_headers.append(ALIASES.get(h, h))
 
-def write_text(path: str, text: str) -> None:
-    ensure_dir(os.path.dirname(path))
+        # validate minimum keys
+        low_headers = set(final_headers)
+        if "case_id" not in low_headers and "id" not in low_headers:
+            raise ValueError("cases.csv must contain a 'case_id' (or 'id') column.")
+
+        rows = []
+        for row in reader:
+            norm_row = {}
+            for orig, norm in header_map.items():
+                val = row.get(orig, "")
+                target = ALIASES.get(norm, norm)
+                norm_row[target] = val
+            # upgrade 'id' -> 'case_id' if present
+            if "case_id" not in norm_row and "id" in norm_row:
+                norm_row["case_id"] = norm_row.pop("id")
+            rows.append(norm_row)
+
+    return rows
+
+def write_cases_csv(path: os.PathLike, rows: Iterable[Dict[str, str]]) -> None:
+    rows = list(rows)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    # gather all keys
+    all_keys = set()
+    for r in rows:
+        all_keys.update(r.keys())
+    # prefer ordering
+    fieldnames = [k for k in ["case_id", "jurisdiction", "source_url"] if k in all_keys] + \
+                 sorted(list(all_keys - {"case_id", "jurisdiction", "source_url"}))
     with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write(text)
-
-
-def repo_root() -> str:
-    return str(pathlib.Path(__file__).resolve().parents[1])
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
