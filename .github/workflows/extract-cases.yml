@@ -1,0 +1,51 @@
+name: Extract cases from LTJ lines
+
+on:
+  workflow_dispatch:
+    inputs:
+      range_start:
+        description: 'Start line (inclusive) in LTJ.lines.json'
+        required: false
+        default: '1276'
+      range_end:
+        description: 'End line (inclusive) in LTJ.lines.json'
+        required: false
+        default: '3083'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out CourtFirst
+        uses: actions/checkout@v4
+
+      - name: Check out LTJ-ui (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: Info1691/LTJ-ui
+          path: LTJ-ui
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps (none strictly required)
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Extract cases (lines 1276–3083 by default)
+        run: |
+          python tools/extract_cases_from_lines.py \
+            --ltj_lines LTJ-ui/out/LTJ.lines.json \
+            --out out/cases.csv \
+            --range_start "${{ github.event.inputs.range_start }}" \
+            --range_end   "${{ github.event.inputs.range_end }}"
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: courtfirst-cases
+          path: out/cases.csv
+          if-no-files-found: error
