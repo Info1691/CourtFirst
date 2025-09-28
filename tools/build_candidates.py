@@ -1,53 +1,55 @@
 #!/usr/bin/env python3
-"""
-Generate breach candidates by scanning case texts for breach-like phrases.
-Output: out/breach_candidates.json
-"""
-from __future__ import annotations
-import json, os, re
-from util import OUT_DIR, CORPUS_JSONL, CANDIDATES_JSON, window_around
+import argparse, json, sys, pathlib
 
-PHRASES = [
-    r"breach of trust",
-    r"breach of fiduciary duty",
-    r"fiduciary breach",
-    r"acted in self[- ]interest",
-    r"conflicted trustee",
-    r"misappropriation of (trust )?assets?",
-    r"failure to (disclose|account)",
-    r"unauthori[sz]ed investment",
-    r"negligence\b",
-    r"breach of (mandatory|regulatory) duty",
-]
+def load_json(path: str):
+    p = pathlib.Path(path)
+    if not p.exists():
+        sys.exit(f"ERROR: Missing file {path}")
+    with p.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
-PATTERNS = [re.compile(p, re.I) for p in PHRASES]
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ltj-lines", required=True)
+    ap.add_argument("--ltj-citations", required=True)
+    ap.add_argument("--ltj-index", required=False)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
 
-def main() -> None:
-    os.makedirs(OUT_DIR, exist_ok=True)
+    # Load inputs (structure: arrays/objects as produced by LTJ-ui build)
+    lines = load_json(args.ltj_lines)         # huge; we won’t iterate fully here
+    citations = load_json(args.ltj_citations) # list of citation dicts
+    # index = load_json(args.ltj_index) if args.ltj_index else None
+
+    # Very conservative candidate builder:
+    # Treat any citation record whose "authority_kind" is "case" and
+    # whose snippet includes keywords as a "breach" candidate.
+    KEYWORDS = {"breach of trust", "fiduciary", "breach", "duty", "misappropriation"}
     candidates = []
+    for c in citations if isinstance(citations, list) else []:
+        if str(c.get("authority_kind", "")).lower() != "case":
+            continue
+        snippet = (c.get("snippet") or "").lower()
+        if any(k in snippet for k in KEYWORDS):
+            candidates.append({
+                "phrase": "breach",                # normalized label
+                "normalized": "breach",
+                "polarity": "breach",
+                "jurisdiction": c.get("jurisdiction"),
+                "pid": c.get("from_pid") or c.get("pid"),
+                "authority_id": c.get("to") or c.get("authority_id"),
+                "authority_label": c.get("to_label") or c.get("authority_label"),
+                "snippet": c.get("snippet", ""),
+                "cues": [c.get("cue")] if c.get("cue") else [],
+                "statutes": c.get("statutes", []),
+            })
 
-    with open(CORPUS_JSONL, encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            doc = json.loads(line)
-            text = doc.get("text", "") or ""
-            for pat in PATTERNS:
-                for m in pat.finditer(text):
-                    snippet = window_around(text, m.start(), m.end(), chars=240)
-                    candidates.append({
-                        "case_id": doc.get("case_id"),
-                        "title": doc.get("title"),
-                        "url": doc.get("url"),
-                        "jurisdiction": doc.get("jurisdiction"),
-                        "match": m.group(0),
-                        "tag_suggestion": pat.pattern,   # keep raw pattern for transparency
-                        "snippet": snippet,
-                        "confidence": 0.6,               # simple heuristic; tune later
-                    })
+    outp = pathlib.Path(args.out)
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    with outp.open("w", encoding="utf-8") as f:
+        json.dump({"candidates": candidates}, f, ensure_ascii=False, indent=2)
 
-    with open(CANDIDATES_JSON, "w", encoding="utf-8") as out:
-        json.dump({"candidates": candidates}, out, ensure_ascii=False, indent=2)
+    print(f"Wrote {len(candidates)} candidates -> {outp}")
 
 if __name__ == "__main__":
     main()
