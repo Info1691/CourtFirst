@@ -1,61 +1,54 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-fetch_cases.py
-Input : out/sources.json  (from enrich_sources.py)
-Output: out/html/{case_id}.html (exact server output)
-        out/fetch_log.json       (status per case)
+Fetch HTML for cases that have 'source_url'.
+Strictly copies what's online; no rewriting or invented text.
 """
 
-import json
-import os
-from typing import Dict, Any, List
+import argparse
+import urllib.request
+from pathlib import Path
+from tools.util import read_cases_csv, sleep_jitter, safe_filename, save_json
 
-from tools.util import repo_root, read_json, http_get, sleep_jitter, write_text, save_json, safe_filename, ensure_dir
+UA = "Mozilla/5.0 (compatible; CourtFirstBot/0.1; +https://example.invalid/bot)"
 
-IN_SOURCES = os.path.join(repo_root(), "out", "sources.json")
-OUT_HTML_DIR = os.path.join(repo_root(), "out", "html")
-OUT_LOG = os.path.join(repo_root(), "out", "fetch_log.json")
+def http_get(url: str, timeout: int = 25) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
 
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--in", dest="in_csv", required=True, help="CSV from enrich_sources (cases_with_urls.csv)")
+    p.add_argument("--html", dest="html_dir", required=True, help="Directory to save raw HTML")
+    p.add_argument("--report", dest="report_json", required=True, help="Path to save fetch report JSON")
+    return p.parse_args()
 
-def main() -> None:
-    ensure_dir(OUT_HTML_DIR)
-    sources: List[Dict[str, Any]] = read_json(IN_SOURCES)
-    log: List[Dict[str, Any]] = []
+def main():
+    args = parse_args()
+    html_dir = Path(args.html_dir)
+    html_dir.mkdir(parents=True, exist_ok=True)
 
-    for item in sources:
-        case_id = item.get("case_id")
-        url = item.get("resolved_url")
+    cases = read_cases_csv(args.in_csv)
+    report = []
+    for c in cases:
+        cid = c.get("case_id", "").strip() or "unknown"
+        url = (c.get("source_url") or "").strip()
         if not url:
-            log.append({"case_id": case_id, "status": "skipped_no_url"})
+            report.append({"case_id": cid, "status": "skipped", "reason": "no_source_url"})
             continue
-
+        out_file = html_dir / f"{safe_filename(cid)}.html"
         try:
-            resp = http_get(url)
-            html = resp.text  # EXACT HTML as delivered
-            fname = f"{safe_filename(case_id)}.html"
-            out_path = os.path.join(OUT_HTML_DIR, fname)
-            write_text(out_path, html)
-            log.append({
-                "case_id": case_id,
-                "status": "ok",
-                "request_url": url,
-                "final_url": resp.url,
-                "http_status": resp.status_code,
-                "bytes": len(html.encode("utf-8"))
-            })
+            data = http_get(url)
+            out_file.write_bytes(data)
+            report.append({"case_id": cid, "status": "ok", "bytes": len(data), "path": str(out_file), "url": url})
         except Exception as e:
-            log.append({
-                "case_id": case_id,
-                "status": "error",
-                "request_url": url,
-                "error": repr(e)
-            })
-
+            report.append({"case_id": cid, "status": "error", "error": str(e), "url": url})
         sleep_jitter()
 
-    save_json(OUT_LOG, log)
-    print(f"Saved HTML to {OUT_HTML_DIR} and log to {OUT_LOG}")
-
+    save_json(args.report_json, report)
+    print(f"Fetched {sum(1 for r in report if r['status']=='ok')} pages; report -> {args.report_json}")
 
 if __name__ == "__main__":
     main()
