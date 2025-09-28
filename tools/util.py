@@ -1,24 +1,41 @@
-import time, random, json, re
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
-import urllib.parse
-import urllib.request
+#!/usr/bin/env python3
+"""
+Shared helpers for CourtFirst tools.
+"""
 
-UA = "CourtFirstBot/0.1 (+contact: maintainer; purpose: legal research)"
+import json
+import os
+import random
+import time
+from typing import Any, Dict, Optional
 
-def http_get(url: str, timeout: int = 30) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", errors="replace")
+import requests
 
-def sleep_jitter(base: float = 1.0, spread: float = 0.5):
-    time.sleep(base + random.random() * spread)
 
-def safe_filename(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", s)[:200]
+def ensure_dir(path: str) -> None:
+    if path and not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
 
-def save_json(path: str, data: Any):
-    import os, json
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+def save_json(path: str, data: Any) -> None:
+    ensure_dir(os.path.dirname(path))
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def sleep_jitter(lo: float = 0.5, hi: float = 1.25) -> None:
+    time.sleep(random.uniform(lo, hi))
+
+
+def http_get(url: str, user_agent: str = "CourtFirstBot/1.0", timeout: int = 30) -> Optional[str]:
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    # Only keep HTML-like responses
+    ctype = r.headers.get("Content-Type", "")
+    if "html" not in ctype.lower():
+        return r.text  # Still return; caller can decide
+    return r.text
