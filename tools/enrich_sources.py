@@ -1,53 +1,47 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-enrich_sources.py
-Input : data/cases.csv  (columns: case_id, jurisdiction, source_url)
-Output: out/sources.json  [{case_id, jurisdiction, resolved_url}]
-Rule: No fabrication. If source_url is blank, resolved_url is null.
+Pass-through URL enricher.
+
+- Reads an input CSV of cases (any header style).
+- Accepts 'url' OR 'source_url' (or link/href), normalizes to 'source_url'.
+- Writes OUT/cases_with_urls.csv with a guaranteed 'source_url' column.
+- Also writes OUT/urls.json for debugging/inspection.
+
+No guessing, no fabrication: if there is no URL, the cell stays blank.
 """
 
-import csv
-import os
-from typing import List, Dict, Optional
+import argparse
+from pathlib import Path
+from tools.util import read_cases_csv, write_cases_csv, save_json
 
-from tools.util import save_json, repo_root
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--in", dest="in_csv", required=True, help="Path to input cases CSV")
+    p.add_argument("--outdir", dest="outdir", required=True, help="Output directory")
+    return p.parse_args()
 
-IN_CSV = os.path.join(repo_root(), "data", "cases.csv")
-OUT_JSON = os.path.join(repo_root(), "out", "sources.json")
+def main():
+    args = parse_args()
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
+    cases = read_cases_csv(args.in_csv)
 
-def read_cases_csv(path: str) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        required = {"case_id", "jurisdiction", "source_url"}
-        missing = required - set(map(str.lower, r.fieldnames or []))
-        if missing:
-            raise ValueError(f"cases.csv missing required columns (case-insensitive): {sorted(missing)}")
-        for row in r:
-            # normalize keys to expected case
-            item = {
-                "case_id": row.get("case_id") or row.get("CASE_ID") or row.get("Case_ID"),
-                "jurisdiction": row.get("jurisdiction") or row.get("JURISDICTION") or row.get("Jurisdiction"),
-                "source_url": row.get("source_url") or row.get("SOURCE_URL") or row.get("Source_URL") or "",
-            }
-            rows.append(item)
-    return rows
-
-
-def main() -> None:
-    cases = read_cases_csv(IN_CSV)
-    out: List[Dict[str, Optional[str]]] = []
+    # make sure 'source_url' exists (copy from 'url' already handled in util.read_cases_csv)
     for c in cases:
-        url = (c.get("source_url") or "").strip() or None
-        out.append({
-            "case_id": c["case_id"],
-            "jurisdiction": c["jurisdiction"],
-            "resolved_url": url,   # pass-through only; no guessing
-        })
-    save_json(OUT_JSON, out)
-    print(f"Wrote {len(out)} items -> {OUT_JSON}")
+        c.setdefault("source_url", c.get("url", ""))
 
+    # Write normalized CSV
+    out_csv = outdir / "cases_with_urls.csv"
+    write_cases_csv(out_csv, cases)
+
+    # Small JSON for quick auditing
+    urls = [{"case_id": c.get("case_id", ""), "source_url": c.get("source_url", "")} for c in cases]
+    save_json(outdir / "urls.json", urls)
+
+    print(f"Wrote {len(cases)} rows -> {out_csv}")
 
 if __name__ == "__main__":
     main()
