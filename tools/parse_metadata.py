@@ -2,46 +2,85 @@
 # -*- coding: utf-8 -*-
 
 """
-Ultra-conservative metadata parser.
-- Extracts <title> and first <h1>, if present.
-- Writes a JSON list; no invented content.
+Parse minimal metadata from fetched HTML files.
+
+Inputs:
+  --html DIR/         (files saved by fetch_cases.py)
+Outputs:
+  --out JSON          (array of dicts per case_id)
+
+For each file we extract ONLY what is present in the HTML:
+  - title (from <title> if present)
+  - neutral citation (simple regex from title/body if present)
+  - court/site (simple domain from saved report if available)
+We DO NOT fill in anything we cannot find; missing fields are omitted.
 """
 
+from pathlib import Path
 import argparse
 import re
-from pathlib import Path
-from tools.util import save_json
+import json
+from bs4 import BeautifulSoup
 
-TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
-H1_RE = re.compile(rb"<h1[^>]*>(.*?)</h1>", re.I | re.S)
+from tools.util import load_json, save_json
 
-def textify(b: bytes) -> str:
-    t = re.sub(rb"<[^>]+>", b"", b or b"", flags=re.S)
-    return (t.decode("utf-8", "ignore")).strip()
+CITE_RE = re.compile(r"\[(\d{4})\]\s*[A-Z]{2,}[A-Za-z]*\s*\d+|\bJRC\s*\d{2,4}\b")
 
-def extract_bits(html: bytes):
-    title = textify(TITLE_RE.search(html).group(1)) if TITLE_RE.search(html) else ""
-    h1 = textify(H1_RE.search(html).group(1)) if H1_RE.search(html) else ""
-    return {"title": title, "h1": h1}
+def extract_fields(html_text: str):
+    soup = BeautifulSoup(html_text, "html.parser")
+    title = soup.title.get_text(strip=True) if soup.title else None
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--html", dest="html_dir", required=True)
-    p.add_argument("--out", dest="out_json", required=True)
-    return p.parse_args()
+    # Try to locate a neutral citation anywhere in the doc
+    cite = None
+    in_title = title or ""
+    m = CITE_RE.search(in_title)
+    if not m:
+        body_text = soup.get_text(separator=" ", strip=True)
+        m = CITE_RE.search(body_text[:2000])  # first chunk only for speed
+    if m:
+        cite = m.group(0)
+
+    return {"title": title, "neutral_citation": cite}
 
 def main():
-    args = parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--html", dest="html_dir", required=True)
+    ap.add_argument("--out", dest="out_json", required=True)
+    ap.add_argument("--report", dest="report_json", default="out/fetch_report.json",
+                    help="fetch report for mapping filenames to URLs (optional)")
+    args = ap.parse_args()
+
     html_dir = Path(args.html_dir)
-    items = []
-    for f in sorted(html_dir.glob("*.html")):
+    out_path = Path(args.out_json)
+
+    # Optionally load report to map URLs
+    url_by_file = {}
+    try:
+        report = load_json(Path(args.report_json))
+        for ok in report.get("ok", []):
+            html_file = ok.get("html_file")
+            if html_file:
+                url_by_file[Path(html_file).name] = ok.get("url")
+    except Exception:
+        pass
+
+    records = []
+    for p in sorted(html_dir.glob("*.html")):
         try:
-            bits = extract_bits(f.read_bytes())
-            items.append({"file": f.name, **bits})
+            text = p.read_text(encoding="utf-8", errors="ignore")
+            fields = extract_fields(text)
+            rec = {"case_file": p.name}
+            if url_by_file.get(p.name):
+                rec["source_url"] = url_by_file[p.name]
+            # Only include fields that exist
+            for k, v in fields.items():
+                if v:
+                    rec[k] = v
+            records.append(rec)
         except Exception as e:
-            items.append({"file": f.name, "error": str(e)})
-    save_json(args.out_json, items)
-    print(f"Wrote metadata for {len(items)} files -> {args.out_json}")
+            records.append({"case_file": p.name, "error": str(e)})
+
+    save_json(records, out_path)
 
 if __name__ == "__main__":
     main()
