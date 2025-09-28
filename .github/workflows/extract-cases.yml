@@ -3,49 +3,57 @@ name: Extract cases from LTJ lines
 on:
   workflow_dispatch:
     inputs:
-      range_start:
-        description: 'Start line (inclusive) in LTJ.lines.json'
+      start_line:
+        description: "Start line (inclusive) in LTJ.lines.json"
         required: false
-        default: '1276'
-      range_end:
-        description: 'End line (inclusive) in LTJ.lines.json'
+        default: "1276"
+      end_line:
+        description: "End line (inclusive) in LTJ.lines.json"
         required: false
-        default: '3083'
+        default: "3083"
+      ltj_ref:
+        description: "LTJ-ui ref (branch/tag/sha)"
+        required: false
+        default: "main"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Check out CourtFirst
         uses: actions/checkout@v4
 
-      - name: Check out LTJ-ui (read-only)
+      - name: Check out LTJ-ui (private) read-only
         uses: actions/checkout@v4
         with:
           repository: Info1691/LTJ-ui
+          ref: ${{ github.event.inputs.ltj_ref }}
+          token: ${{ secrets.LTJ_PAT }}
           path: LTJ-ui
-          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install deps (none strictly required)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
+          pip install rapidfuzz
 
-      - name: Extract cases (lines 1276–3083 by default)
+      - name: Extract cases
         run: |
-          python tools/extract_cases_from_lines.py \
-            --ltj_lines LTJ-ui/out/LTJ.lines.json \
-            --out out/cases.csv \
-            --range_start "${{ github.event.inputs.range_start }}" \
-            --range_end   "${{ github.event.inputs.range_end }}"
-      
-      - name: Upload artifacts
+          mkdir -p out
+          python tools/extract_cases.py \
+            --lines LTJ-ui/out/LTJ.lines.json \
+            --start ${{ github.event.inputs.start_line }} \
+            --end   ${{ github.event.inputs.end_line }} \
+            --out   out/cases.csv
+
+      - name: Upload artifact (cases.csv)
         uses: actions/upload-artifact@v4
         with:
-          name: courtfirst-cases
+          name: cases_csv
           path: out/cases.csv
-          if-no-files-found: error
