@@ -4,24 +4,36 @@
 import argparse
 import csv
 import json
-import os
 import re
 import sys
 from pathlib import Path
-from typing import Iterable, List, Dict, Any, Tuple
+from typing import Dict, List, Any, Tuple
 
+# Output schema
 CASE_COLS = ["case_id", "title", "citation", "jurisdiction", "url", "source_line"]
 
-CITATION_RE = re.compile(r"\[[0-9]{4}[^]]*\]")  # captures things like [1999] ... , [2014] (1) ...
-TRAILING_PAGES_RE = re.compile(r"[,;]\s*(pp?\.\s*\d+|\d+(?:-\d+)?)\s*$", re.IGNORECASE)
+# Heuristics
+CITATION_RE = re.compile(r"\[[0-9]{4}[^]]*\]")   # e.g. [2010] EWHC ...
+# obvious trailing page snippets like ", 2418-84" / "; 54-55" / ", 1-12, 13-14"
+TRAILING_PAGES_RE = re.compile(r"[,;]\s*(?:pp?\.\s*)?\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*\s*$", re.IGNORECASE)
+
+# Looks like a pure numeric/index line? (no letters, only digits/commas/hyphens)
+NUMERIC_INDEX_RE = re.compile(r"^\s*(\d+(?:\s*-\s*\d+)?)(\s*,\s*\d+(?:\s*-\s*\d+)?)*\s*$")
+
+# Require at least one of these "case-ish" hints if present
+CASE_HINTS = (
+    " v ",            # Versus pattern
+    " v. ",           # Sometimes with a dot
+    " in re ",        # In re
+    " In re ",        # Capitalized
+    " re ",           # re Something
+    "JLR", "JRC",     # Jersey reports/citations in our corpus
+    "EWHC", "EWCA", "UKSC", "UKPC", "WLR", "All ER",
+    "Court", "Tribunal",
+    "Ltd", "plc", "LLP", "Inc", "Company", "Trust", "Trustee",
+)
 
 def load_lines(path: Path) -> List[Dict[str, Any]]:
-    """
-    Load LTJ-ui/out/LTJ.lines.json.
-    Accepts either:
-      - a JSON array of objects with keys like {"line": 1276, "text": "..."}
-      - an object containing {"lines": [ ... ] }
-    """
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
@@ -32,60 +44,81 @@ def load_lines(path: Path) -> List[Dict[str, Any]]:
 
     if isinstance(data, dict) and "lines" in data:
         data = data["lines"]
-
     if not isinstance(data, list):
-        sys.exit("ERROR: Unexpected format in LTJ.lines.json (expected list or object with 'lines').")
+        sys.exit("ERROR: Unexpected LTJ.lines.json structure (need list or {'lines': [...]})")
 
-    # Normalize: ensure each item has "line" (int) and "text" (str)
-    norm = []
+    out = []
     for item in data:
         if isinstance(item, dict):
             line_no = item.get("line") or item.get("line_no") or item.get("lineno")
             text = item.get("text") or item.get("content") or item.get("line_text")
             if isinstance(line_no, int) and isinstance(text, str):
-                norm.append({"line": line_no, "text": text})
-    if not norm:
-        sys.exit("ERROR: No usable line objects found in LTJ.lines.json.")
-    return norm
+                out.append({"line": line_no, "text": text})
+    if not out:
+        sys.exit("ERROR: No usable line objects found.")
+    return out
 
-def slice_lines(lines: List[Dict[str, Any]], start: int, end: int) -> List[Dict[str, Any]]:
-    return [row for row in lines if start <= int(row["line"]) <= end]
+def is_probable_case(raw: str) -> bool:
+    """
+    Filter out index-only numeric rows, keep lines that look like an actual case entry.
+    Rules:
+      - Must contain at least one alphabetic letter.
+      - Must NOT match a pure numeric/index list like '10-21, 10-28'.
+      - Prefer lines with a citation [YYYY ...] OR containing any 'case-ish' cue.
+    """
+    s = raw.strip()
+    if not s:
+        return False
+
+    # Pure numeric/index page lists?
+    if NUMERIC_INDEX_RE.match(s):
+        return False
+
+    # Needs at least one alphabetic character
+    if not re.search(r"[A-Za-z]", s):
+        return False
+
+    # If it has a bracketed year, accept.
+    if CITATION_RE.search(s):
+        return True
+
+    # Otherwise require one of our cues
+    lower = " " + s + " "   # pad to match " v " safely
+    for hint in CASE_HINTS:
+        if hint in lower:
+            return True
+
+    # Otherwise, too ambiguous—skip
+    return False
 
 def parse_case_row(text: str, line_no: int) -> Dict[str, str]:
-    """
-    Minimal, safe parsing:
-      - title: full line text with trailing plain page refs trimmed
-      - citation: first [YYYY ...] chunk if present; else ""
-      - jurisdiction, case_id, url left blank (we will enrich later)
-    We avoid guessing to keep data factual.
-    """
-    citation = ""
+    # Extract citation if present
     m = CITATION_RE.search(text)
-    if m:
-        citation = m.group(0)
+    citation = m.group(0) if m else ""
 
-    # Strip trailing obvious page hints like ", 2418-84" or "; 54-55" etc
-    cleaned = TRAILING_PAGES_RE.sub("", text).strip()
+    # Strip trailing page-like tails
+    cleaned = TRAILING_PAGES_RE.sub("", text).rstrip(" ,;").strip()
 
     return {
-        "case_id": "",          # to be filled later by resolvers
+        "case_id": "",
         "title": cleaned,
         "citation": citation,
-        "jurisdiction": "",     # do not guess
-        "url": "",              # to be populated by enrichers later
+        "jurisdiction": "",
+        "url": "",
         "source_line": str(line_no),
     }
 
-def read_existing_csv(path: Path) -> List[Dict[str, str]]:
+def slice_lines(lines: List[Dict[str, Any]], start: int, end: int) -> List[Dict[str, Any]]:
+    return [r for r in lines if start <= int(r["line"]) <= end]
+
+def read_csv(path: Path) -> List[Dict[str, str]]:
     if not path.exists():
         return []
     rows: List[Dict[str, str]] = []
     with path.open("r", encoding="utf-8", newline="") as f:
         r = csv.DictReader(f)
         for row in r:
-            # keep only known cols; fill missing as empty
-            fixed = {k: row.get(k, "") for k in CASE_COLS}
-            rows.append(fixed)
+            rows.append({col: row.get(col, "") for col in CASE_COLS})
     return rows
 
 def write_csv(path: Path, rows: List[Dict[str, str]]) -> None:
@@ -96,51 +129,45 @@ def write_csv(path: Path, rows: List[Dict[str, str]]) -> None:
         for r in rows:
             w.writerow({k: r.get(k, "") for k in CASE_COLS})
 
-def merge_rows(existing: List[Dict[str, str]], new_rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """
-    Merge on (title, citation) as a stable key; prefer existing non-empty fields.
-    """
+def merge(existing: List[Dict[str, str]], new_rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     key = lambda r: (r.get("title","").strip(), r.get("citation","").strip())
-    index: Dict[Tuple[str,str], Dict[str,str]] = {key(r): r for r in existing}
+    idx: Dict[Tuple[str,str], Dict[str,str]] = {key(r): r for r in existing}
     for r in new_rows:
         k = key(r)
-        if k in index:
-            base = index[k]
-            # fill blanks only
+        if k in idx:
+            base = idx[k]
             for col in CASE_COLS:
                 if not base.get(col) and r.get(col):
                     base[col] = r[col]
         else:
-            index[k] = r
-    # return in a stable order by title
-    return sorted(index.values(), key=lambda r: (r.get("title",""), r.get("citation","")))
+            idx[k] = r
+    return sorted(idx.values(), key=lambda r: (r.get("title",""), r.get("citation","")))
 
 def main():
-    ap = argparse.ArgumentParser(description="Extract LTJ case lines into data/cases.csv")
+    ap = argparse.ArgumentParser(description="Extract case-like lines from LTJ.lines.json")
     ap.add_argument("--ltj-lines", required=True, help="Path to LTJ-ui/out/LTJ.lines.json")
     ap.add_argument("--start", type=int, required=True, help="Start line (inclusive)")
     ap.add_argument("--end", type=int, required=True, help="End line (inclusive)")
-    ap.add_argument("--out", required=True, help="Output CSV path (e.g., data/cases.csv)")
-    ap.add_argument("--merge", action="store_true", help="Merge into existing CSV instead of overwriting")
+    ap.add_argument("--out", required=True, help="Output CSV (e.g., data/cases.csv)")
+    ap.add_argument("--merge", action="store_true", help="Merge into existing CSV instead of overwrite")
     args = ap.parse_args()
 
-    ltj_path = Path(args.ltj_lines)
-    out_path = Path(args.out)
-
-    lines = load_lines(ltj_path)
+    lines = load_lines(Path(args.ltj_lines))
     sliced = slice_lines(lines, args.start, args.end)
 
-    new_rows = [parse_case_row(item["text"], item["line"]) for item in sliced]
+    # Filter + parse
+    filtered = [row for row in sliced if is_probable_case(row["text"])]
+    new_rows = [parse_case_row(row["text"], row["line"]) for row in filtered]
 
+    out_path = Path(args.out)
     if args.merge:
-        existing = read_existing_csv(out_path)
-        merged = merge_rows(existing, new_rows)
-        write_csv(out_path, merged)
+        existing = read_csv(out_path)
+        final = merge(existing, new_rows)
     else:
-        write_csv(out_path, new_rows)
+        final = new_rows
 
-    print(f"Wrote {len(new_rows)} rows to {out_path} "
-          f"({'merged' if args.merge else 'fresh'}).")
+    write_csv(out_path, final)
+    print(f"Kept {len(new_rows)} case-like rows out of {len(sliced)} lines. Wrote {len(final)} total rows to {out_path}.")
 
 if __name__ == "__main__":
     main()
