@@ -1,126 +1,102 @@
-# CourtFirst/tools/extract_cases_from_lines.py
-import argparse, csv, json, re
+#!/usr/bin/env python3
+import argparse, csv, hashlib, json, re
 from pathlib import Path
 
-JRC = re.compile(r"\[(?P<year>\d{4})\]\s*(?P<reporter>JRC)\s*(?P<num>\d{1,4})\b")
-JCA = re.compile(r"\[(?P<year>\d{4})\]\s*(?P<reporter>JCA)\s*(?P<num>\d{1,4})\b")
-JLR = re.compile(r"\[(?P<year>\d{4})\]\s*(?P<reporter>JLR)\s*(?P<num>\d{1,4})\b")
-TITLE = re.compile(r"(?P<title>\b[A-Z][A-Za-z0-9&.'\- ]+?\s+v\s+[A-Z][A-Za-z0-9&.'\- ]+)\b")
+CASE_SPLIT = re.compile(r"\s+v\s+", re.IGNORECASE)
+YEAR_RE = re.compile(r"\[(\d{4})\]")
+# Citations often sit at the end in square brackets or parenthesis; we capture a tidy tail.
+CITATION_TAIL_RE = re.compile(r"(\[[^\]]+\]|\([^)]+\))\s*$")
 
-def slug(s: str) -> str:
-    s = re.sub(r"[^A-Za-z0-9]+", "_", s.strip())
-    return re.sub(r"_+", "_", s).strip("_")
+def make_case_id(raw: str) -> str:
+    h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    return f"LTJ_{h}"
 
-def read_lines(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def parse_line(raw: str):
+    """Return dict with minimal guarantees and only add parsed fields if confident."""
+    out = {"raw": raw}
+    # title (very light: split on ' v ')
+    if CASE_SPLIT.search(raw):
+        parts = CASE_SPLIT.split(raw, maxsplit=1)
+        # keep full title around ' v '
+        out["title"] = f"{parts[0].strip()} v {parts[1].strip()}"
+    # citation tail
+    m = CITATION_TAIL_RE.search(raw)
+    if m:
+        out["citation"] = m.group(1).strip()
+    # year
+    y = YEAR_RE.search(raw)
+    if y:
+        out["year"] = y.group(1)
+    return out
+
+def load_lines(p: Path):
+    with p.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    # tolerate either [{"line":123, "text":"..."}] or simple list of strings
+    lines = []
+    if isinstance(data, list):
+        for i, item in enumerate(data, start=1):
+            if isinstance(item, dict):
+                txt = item.get("text") or item.get("line") or item.get("raw") or ""
+                ln  = item.get("line_no") or item.get("line") or i
+            else:
+                txt = str(item)
+                ln  = i
+            lines.append((ln, txt))
+    else:
+        raise ValueError("Unexpected LTJ.lines.json format")
+    return lines
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ltj_lines", required=True, help="Path to LTJ-ui/out/LTJ.lines.json")
-    ap.add_argument("--out", required=True, help="Path to write cases.csv")
-    ap.add_argument("--range_start", type=int, default=1276)
-    ap.add_argument("--range_end", type=int, default=3083)
+    ap.add_argument("--ltj-lines", required=True, help="Path to LTJ-ui/out/LTJ.lines.json")
+    ap.add_argument("--start", type=int, required=True, help="Start line (inclusive)")
+    ap.add_argument("--end", type=int, required=True, help="End line (inclusive)")
+    ap.add_argument("--out", required=True, help="Output CSV (CourtFirst/data/cases.csv)")
+    ap.add_argument("--merge", action="store_true", help="Merge with existing CSV if present")
     args = ap.parse_args()
 
-    lines = read_lines(args.ltj_lines)
+    lines = load_lines(Path(args.ltj_lines))
+    # filter by the requested span
+    span = [(ln, txt) for (ln, txt) in lines if args.start <= ln <= args.end and txt.strip()]
 
-    # Heuristics: LTJ.lines.json is usually a list of objects:
-    # { "pid": "...", "line": <int>, "text": "..." }
-    # If it’s not, we fail loudly so you can adjust.
-    if not isinstance(lines, list) or not lines or "text" not in lines[0]:
-        raise RuntimeError("Unexpected LTJ.lines.json structure; expected list of {pid,line,text}")
+    # build fresh rows
+    new_rows = []
+    for ln, raw in span:
+        parsed = parse_line(raw)
+        case_id = make_case_id(raw)
+        row = {
+            "case_id": case_id,
+            "title": parsed.get("title",""),
+            "citation": parsed.get("citation",""),
+            "year": parsed.get("year",""),
+            "jurisdiction": "",                 # unknown at this stage
+            "source_url": "",                   # to be filled by enrichers
+            "raw": raw,                         # exact, unmodified line text
+            "ltj_line": ln
+        }
+        new_rows.append(row)
 
-    start, end = args.range_start, args.range_end
-    picked = [row for row in lines if isinstance(row.get("line"), int) and start <= row["line"] <= end]
+    # optional merge (by raw text hash)
+    out_path = Path(args.out)
+    merged = { r["raw"]: r for r in new_rows }
 
-    seen = set()
-    rows = []
+    if args.merge and out_path.exists():
+        with out_path.open("r", newline="", encoding="utf-8") as f:
+            rdr = csv.DictReader(f)
+            for r in rdr:
+                if r.get("raw"):
+                    merged.setdefault(r["raw"], r)  # keep existing if already there
 
-    for row in picked:
-        txt = row.get("text", "") or ""
-        pid = row.get("pid", "")
-        line_no = row.get("line", None)
-
-        found = False
-
-        # Prefer exact JRC/JCA/JLR citations
-        for rx in (JRC, JCA, JLR):
-            for m in rx.finditer(txt):
-                d = m.groupdict()
-                year = d.get("year")
-                reporter = d.get("reporter")
-                num = d.get("num")
-                cid = f"{reporter}_{year}_{num}"
-                key = (cid, line_no)
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                title = None
-                t = TITLE.search(txt)
-                if t:
-                    title = t.group("title").strip()
-
-                rows.append({
-                    "case_id": cid,
-                    "jurisdiction": "Jersey",
-                    "title": title or "",
-                    "year": year or "",
-                    "reporter": reporter or "",
-                    "report_no": num or "",
-                    "pid": pid,
-                    "line_no": line_no,
-                    "raw": txt.strip()
-                })
-                found = True
-
-        if found:
-            continue
-
-        # If no formal reporter found, try title-only lines
-        t = TITLE.search(txt)
-        if t:
-            title = t.group("title").strip()
-            cid = slug(title)[:80]
-            key = (cid, line_no)
-            if key not in seen:
-                seen.add(key)
-                rows.append({
-                    "case_id": cid,
-                    "jurisdiction": "Jersey",
-                    "title": title,
-                    "year": "",
-                    "reporter": "",
-                    "report_no": "",
-                    "pid": pid,
-                    "line_no": line_no,
-                    "raw": txt.strip()
-                })
-
-    # Deduplicate by case_id preferring JRC/JCA over slug titles
-    by_id = {}
-    for r in rows:
-        cid = r["case_id"]
-        cur = by_id.get(cid)
-        if cur is None:
-            by_id[cid] = r
-        else:
-            # Keep the one with reporter if current has none
-            if not cur.get("reporter") and r.get("reporter"):
-                by_id[cid] = r
-
-    outp = Path(args.out)
-    outp.parent.mkdir(parents=True, exist_ok=True)
-    with open(outp, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=[
-            "case_id","jurisdiction","title","year","reporter","report_no","pid","line_no","raw"
-        ])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["case_id","title","citation","year","jurisdiction","source_url","raw","ltj_line"]
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
-        for r in sorted(by_id.values(), key=lambda x: (x["year"] or "0000", x["case_id"])):
-            w.writerow(r)
+        for r in merged.values():
+            w.writerow({k: r.get(k,"") for k in fields})
 
-    print(f"Wrote {len(by_id)} cases → {outp}")
+    print(f"Wrote {len(merged)} rows to {out_path}")
 
 if __name__ == "__main__":
     main()
