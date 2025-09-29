@@ -1,36 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse
-import csv
-import json
-import re
-import sys
+import argparse, csv, json, re, sys
 from pathlib import Path
 from typing import Dict, List, Any, Tuple
 
-# Output schema
 CASE_COLS = ["case_id", "title", "citation", "jurisdiction", "url", "source_line"]
 
-# Heuristics
-CITATION_RE = re.compile(r"\[[0-9]{4}[^]]*\]")   # e.g. [2010] EWHC ...
-# obvious trailing page snippets like ", 2418-84" / "; 54-55" / ", 1-12, 13-14"
+# Signals a *real* case line
+CITATION_RE = re.compile(r"\[[0-9]{4}[^]]*\]")  # e.g. [2014] EWCA Civ 123
+NUMERIC_INDEX_RE = re.compile(r"^\s*(\d+(?:\s*-\s*\d+)?)(\s*,\s*\d+(?:\s*-\s*\d+)?)*\s*$")
 TRAILING_PAGES_RE = re.compile(r"[,;]\s*(?:pp?\.\s*)?\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*\s*$", re.IGNORECASE)
 
-# Looks like a pure numeric/index line? (no letters, only digits/commas/hyphens)
-NUMERIC_INDEX_RE = re.compile(r"^\s*(\d+(?:\s*-\s*\d+)?)(\s*,\s*\d+(?:\s*-\s*\d+)?)*\s*$")
-
-# Require at least one of these "case-ish" hints if present
 CASE_HINTS = (
-    " v ",            # Versus pattern
-    " v. ",           # Sometimes with a dot
-    " in re ",        # In re
-    " In re ",        # Capitalized
-    " re ",           # re Something
-    "JLR", "JRC",     # Jersey reports/citations in our corpus
-    "EWHC", "EWCA", "UKSC", "UKPC", "WLR", "All ER",
-    "Court", "Tribunal",
-    "Ltd", "plc", "LLP", "Inc", "Company", "Trust", "Trustee",
+    " v ", " v. ", " in re ", " In re ", " re ",
+    "JLR", "JRC", "EWHC", "EWCA", "UKSC", "UKPC", "WLR", "All ER",
+    "Court", "Tribunal", "Ch", "QB", "CA", "PC",
+    " Ltd", " plc", " LLP", " Inc", " Company", " Trust", " Trustee",
 )
 
 def load_lines(path: Path) -> List[Dict[str, Any]]:
@@ -45,63 +31,44 @@ def load_lines(path: Path) -> List[Dict[str, Any]]:
     if isinstance(data, dict) and "lines" in data:
         data = data["lines"]
     if not isinstance(data, list):
-        sys.exit("ERROR: Unexpected LTJ.lines.json structure (need list or {'lines': [...]})")
+        sys.exit("ERROR: Unexpected LTJ.lines.json structure.")
 
     out = []
-    for item in data:
-        if isinstance(item, dict):
-            line_no = item.get("line") or item.get("line_no") or item.get("lineno")
-            text = item.get("text") or item.get("content") or item.get("line_text")
-            if isinstance(line_no, int) and isinstance(text, str):
-                out.append({"line": line_no, "text": text})
+    for it in data:
+        if not isinstance(it, dict): 
+            continue
+        line_no = it.get("line") or it.get("line_no") or it.get("lineno")
+        text = it.get("text") or it.get("content") or it.get("line_text")
+        if isinstance(line_no, int) and isinstance(text, str):
+            out.append({"line": line_no, "text": text})
     if not out:
         sys.exit("ERROR: No usable line objects found.")
     return out
 
-def is_probable_case(raw: str) -> bool:
-    """
-    Filter out index-only numeric rows, keep lines that look like an actual case entry.
-    Rules:
-      - Must contain at least one alphabetic letter.
-      - Must NOT match a pure numeric/index list like '10-21, 10-28'.
-      - Prefer lines with a citation [YYYY ...] OR containing any 'case-ish' cue.
-    """
-    s = raw.strip()
+def looks_like_case(s: str) -> bool:
+    s = s.strip()
     if not s:
         return False
-
-    # Pure numeric/index page lists?
+    # reject pure numeric/page-range lists
     if NUMERIC_INDEX_RE.match(s):
         return False
-
-    # Needs at least one alphabetic character
+    # must contain at least one letter
     if not re.search(r"[A-Za-z]", s):
         return False
-
-    # If it has a bracketed year, accept.
+    # accept if citation present
     if CITATION_RE.search(s):
         return True
+    # otherwise require a case-ish cue
+    padded = f" {s} "
+    return any(hint in padded for hint in CASE_HINTS)
 
-    # Otherwise require one of our cues
-    lower = " " + s + " "   # pad to match " v " safely
-    for hint in CASE_HINTS:
-        if hint in lower:
-            return True
-
-    # Otherwise, too ambiguous—skip
-    return False
-
-def parse_case_row(text: str, line_no: int) -> Dict[str, str]:
-    # Extract citation if present
+def parse_case(text: str, line_no: int) -> Dict[str, str]:
     m = CITATION_RE.search(text)
     citation = m.group(0) if m else ""
-
-    # Strip trailing page-like tails
-    cleaned = TRAILING_PAGES_RE.sub("", text).rstrip(" ,;").strip()
-
+    title = TRAILING_PAGES_RE.sub("", text).rstrip(" ,;").strip()
     return {
         "case_id": "",
-        "title": cleaned,
+        "title": title,
         "citation": citation,
         "jurisdiction": "",
         "url": "",
@@ -118,7 +85,7 @@ def read_csv(path: Path) -> List[Dict[str, str]]:
     with path.open("r", encoding="utf-8", newline="") as f:
         r = csv.DictReader(f)
         for row in r:
-            rows.append({col: row.get(col, "") for col in CASE_COLS})
+            rows.append({c: row.get(c, "") for c in CASE_COLS})
     return rows
 
 def write_csv(path: Path, rows: List[Dict[str, str]]) -> None:
@@ -131,7 +98,7 @@ def write_csv(path: Path, rows: List[Dict[str, str]]) -> None:
 
 def merge(existing: List[Dict[str, str]], new_rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     key = lambda r: (r.get("title","").strip(), r.get("citation","").strip())
-    idx: Dict[Tuple[str,str], Dict[str,str]] = {key(r): r for r in existing}
+    idx = {key(r): r for r in existing}
     for r in new_rows:
         k = key(r)
         if k in idx:
@@ -144,30 +111,47 @@ def merge(existing: List[Dict[str, str]], new_rows: List[Dict[str, str]]) -> Lis
     return sorted(idx.values(), key=lambda r: (r.get("title",""), r.get("citation","")))
 
 def main():
-    ap = argparse.ArgumentParser(description="Extract case-like lines from LTJ.lines.json")
-    ap.add_argument("--ltj-lines", required=True, help="Path to LTJ-ui/out/LTJ.lines.json")
-    ap.add_argument("--start", type=int, required=True, help="Start line (inclusive)")
-    ap.add_argument("--end", type=int, required=True, help="End line (inclusive)")
-    ap.add_argument("--out", required=True, help="Output CSV (e.g., data/cases.csv)")
-    ap.add_argument("--merge", action="store_true", help="Merge into existing CSV instead of overwrite")
+    ap = argparse.ArgumentParser(description="Extract case entries from LTJ lines (filters index/page rows).")
+    ap.add_argument("--ltj-lines", required=True)
+    ap.add_argument("--start", type=int, required=True)
+    ap.add_argument("--end", type=int, required=True)
+    ap.add_argument("--out", required=True)                   # e.g. data/cases.csv
+    ap.add_argument("--merge", action="store_true")
+    ap.add_argument("--report", default="out/extract_report.json")
     args = ap.parse_args()
 
     lines = load_lines(Path(args.ltj_lines))
-    sliced = slice_lines(lines, args.start, args.end)
+    window = slice_lines(lines, args.start, args.end)
 
-    # Filter + parse
-    filtered = [row for row in sliced if is_probable_case(row["text"])]
-    new_rows = [parse_case_row(row["text"], row["line"]) for row in filtered]
+    kept, dropped = [], []
+    for row in window:
+        txt = row["text"]
+        if looks_like_case(txt):
+            kept.append(parse_case(txt, row["line"]))
+        else:
+            dropped.append({"line": row["line"], "text": txt})
 
     out_path = Path(args.out)
-    if args.merge:
-        existing = read_csv(out_path)
-        final = merge(existing, new_rows)
-    else:
-        final = new_rows
+    existing = read_csv(out_path) if args.merge else []
+    final = merge(existing, kept)
 
     write_csv(out_path, final)
-    print(f"Kept {len(new_rows)} case-like rows out of {len(sliced)} lines. Wrote {len(final)} total rows to {out_path}.")
+
+    # Write a small report so you can audit exactly what was filtered
+    report_path = Path(args.report)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with report_path.open("w", encoding="utf-8") as f:
+        json.dump({
+            "range": {"start": args.start, "end": args.end},
+            "sliced": len(window),
+            "kept": len(kept),
+            "dropped": len(dropped),
+            "sample_dropped": dropped[:20],  # small sample
+            "output_csv": str(out_path)
+        }, f, ensure_ascii=False, indent=2)
+
+    print(f"[extract] sliced={len(window)} kept={len(kept)} dropped={len(dropped)} -> {out_path}")
+    print(f"[extract] report -> {report_path}")
 
 if __name__ == "__main__":
     main()
