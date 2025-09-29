@@ -3,11 +3,11 @@ name: Extract cases from LTJ lines
 on:
   workflow_dispatch:
     inputs:
-      start_line:
+      start:
         description: "Start line (inclusive) in LTJ.lines.json"
         required: true
         default: "1276"
-      end_line:
+      end:
         description: "End line (inclusive) in LTJ.lines.json"
         required: true
         default: "3083"
@@ -20,16 +20,17 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # needed to commit back to CourtFirst
+      contents: write
+
     steps:
-      - name: Check out CourtFirst (target repo)
+      - name: Check out CourtFirst
         uses: actions/checkout@v4
 
-      - name: Check out LTJ-ui (private) read-only
+      - name: Check out LTJ-ui (private, read-only)
         uses: actions/checkout@v4
         with:
           repository: Info1691/LTJ-ui
-          ref: ${{ inputs.ltj_ref }}
+          ref: ${{ github.event.inputs.ltj_ref }}
           token: ${{ secrets.LTJ_UI_TOKEN }}
           path: LTJ-ui
 
@@ -38,29 +39,24 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (optional)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          # no strict deps required for this script; csv/json only
-          true
 
-      - name: Extract lines -> data/cases.csv (merge)
+      - name: Extract case lines (filters numeric/page indexes)
         run: |
           python tools/extract_cases_from_lines.py \
-            --ltj-lines "LTJ-ui/out/LTJ.lines.json" \
-            --start "${{ inputs.start_line }}" \
-            --end "${{ inputs.end_line }}" \
-            --out "data/cases.csv" \
-            --merge
+            --ltj-lines LTJ-ui/out/LTJ.lines.json \
+            --start "${{ github.event.inputs.start }}" \
+            --end "${{ github.event.inputs.end }}" \
+            --out data/cases.csv \
+            --merge \
+            --report out/extract_report.json
 
-      - name: Commit results into CourtFirst
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/cases.csv
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "Extract LTJ cases lines ${{ inputs.start_line }}–${{ inputs.end_line }} from ${{ inputs.ltj_ref }}"
-            git push
-          fi
+      - name: Upload extract report
+        uses: actions/upload-artifact@v4
+        with:
+          name: extract-report
+          path: |
+            out/extract_report.json
+            data/cases.csv
