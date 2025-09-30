@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       start_line:
-        description: "Start line (inclusive) in LTJ.lines.json"
+        description: "Start line (inclusive) in LTJ lines"
         required: true
         default: "1276"
       end_line:
-        description: "End line (inclusive) in LTJ.lines.json"
+        description: "End line (inclusive) in LTJ lines"
         required: true
         default: "3083"
       ltj_ref:
@@ -16,17 +16,12 @@ on:
         required: true
         default: "main"
       lines_filename:
-        description: "Lines file name in LTJ-ui/out (LTJ.lines.json or LTK.lines.json)"
+        description: "File in LTJ-ui/out (LTJ.lines.json or LTK.lines.json)"
         required: true
         default: "LTJ.lines.json"
 
 permissions:
-  contents: write   # we commit data/cases.csv back to this repo
-  actions: read
-
-concurrency:
-  group: extract-cases-${{ github.ref }}
-  cancel-in-progress: false
+  contents: write
 
 env:
   OUT_CSV: data/cases.csv
@@ -34,14 +29,13 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check out CourtFirst (this repo)
+      - name: Check out CourtFirst
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+            fetch-depth: 0
 
-      - name: Ensure data folder exists
+      - name: Make data folder
         run: mkdir -p data
 
       - name: Check out LTJ-ui (private, read-only)
@@ -51,123 +45,37 @@ jobs:
           ref: ${{ inputs.ltj_ref }}
           token: ${{ secrets.LTJ_UI_TOKEN }}
           path: ltj
-          fetch-depth: 1
 
       - name: Verify LTJ lines file exists
-        id: verify_lines
-        shell: bash
+        id: lines
         run: |
-          set -euo pipefail
-          LINES="ltj/out/${{ inputs.lines_filename }}"
-          echo "LINES_FILE=${LINES}" >> "$GITHUB_OUTPUT"
-          if [[ ! -f "${LINES}" ]]; then
-            echo "::error title=Missing LTJ lines file::Expected ${LINES} but it was not found."
-            exit 1
-          fi
-          echo "Found ${LINES}"
+          set -e
+          f="ltj/out/${{ inputs.lines_filename }}"
+          echo "file=$f" >> $GITHUB_OUTPUT
+          [[ -f "$f" ]] || { echo "::error::Missing $f"; exit 1; }
+          echo "Found $f"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Python deps (lenient)
+      - name: Extract and merge
         run: |
-          python -m pip install --upgrade pip
-          if [[ -f requirements.txt ]]; then
-            python -m pip install -r requirements.txt || true
-          fi
+          python tools/extract_cases_from_lines.py \
+            --lines "${{ steps.lines.outputs.file }}" \
+            --start ${{ inputs.start_line }} \
+            --end ${{ inputs.end_line }} \
+            --out "${{ env.OUT_CSV }}"
 
-      - name: Extract lines → rows (merge into data/cases.csv)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - << 'PY'
-          import json, csv, re, os
-          from pathlib import Path
-
-          lines_file = Path("${{ steps.verify_lines.outputs.LINES_FILE }}")
-          start = int("${{ inputs.start_line }}")
-          end   = int("${{ inputs.end_line }}")
-          out_csv = Path("${{ env.OUT_CSV }}")
-          out_csv.parent.mkdir(parents=True, exist_ok=True)
-
-          # Load existing rows (if any) to allow append/merge without duplicates
-          existing = []
-          if out_csv.exists():
-            with out_csv.open("r", newline="", encoding="utf-8") as f:
-              reader = csv.DictReader(f)
-              for r in reader:
-                existing.append(r)
-
-          # Keep a set of (title,citation) pairs to de-dup
-          seen = {(r.get("title",""), r.get("citation","")) for r in existing}
-
-          with lines_file.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-
-          # LTJ/LTK lines are an array of {"line_no": int, "text": "..."}
-          # We slice by line_no range.
-          rows = []
-          for item in data:
-            ln = item.get("line_no")
-            if not isinstance(ln, int):
-              continue
-            if ln < start or ln > end:
-              continue
-            text = (item.get("text") or "").strip()
-            if not text:
-              continue
-
-            # Split into probable title and citation: last [...] block is often the citation.
-            title = text
-            citation = ""
-
-            # Try to capture last bracketed citation like [2014] JCA 095 or [2009 JLR N[49]]
-            m = list(re.finditer(r"\[[^\]]+\]\s*[A-Z]{1,5}[^,\]]*", text))
-            if m:
-              last = m[-1]
-              citation = text[last.start(): last.end()].strip()
-              title = (text[:last.start()] + text[last.end():]).strip(" ,;")
-
-            # Also trim any trailing commas-only bits
-            title = re.sub(r"[,\s]+$", "", title)
-
-            row = {
-              "case_id": "",
-              "title": title,
-              "citation": citation,
-              "jurisdiction": "",
-              "url": "",
-              "source_line": str(ln),
-            }
-            key = (row["title"], row["citation"])
-            if key not in seen and (row["title"] or row["citation"]):
-              rows.append(row)
-              seen.add(key)
-
-          # Write merged results
-          headers = ["case_id","title","citation","jurisdiction","url","source_line"]
-          with out_csv.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=headers)
-            w.writeheader()
-            for r in existing + rows:
-              w.writerow({h: r.get(h, "") for h in headers})
-
-          print(f"Wrote {len(existing)+len(rows)} rows to {out_csv}")
-          PY
-
-      - name: Commit results into CourtFirst
+      - name: Commit CSV
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Extract cases from LTJ lines: ${{ inputs.start_line }}–${{ inputs.end_line }} (${{
-            inputs.lines_filename }})"
-          file_pattern: |
-            data/cases.csv
+          commit_message: "Extracted cases from LTJ lines ${{ inputs.start_line }}–${{ inputs.end_line }}"
+          file_pattern: data/cases.csv
 
-      - name: Upload artifact (cases.csv)
+      - name: Upload CSV (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: cases.csv
           path: data/cases.csv
-          if-no-files-found: error
