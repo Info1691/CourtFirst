@@ -1,128 +1,127 @@
 #!/usr/bin/env python3
-import argparse, json, csv, re, sys
+import argparse, csv, json, re
 from pathlib import Path
 
-CASE_SPLIT_RE = re.compile(r"\s+v\s+", re.IGNORECASE)
-YEAR_IN_BRACKETS_RE = re.compile(r"\[\s*\d{4}\s*]")   # e.g. [2010]
-# A conservative Jersey/UK citation hint (not exhaustive, just to improve signal)
-CITATION_HINT_RE = re.compile(
-    r"\b(JRC|JLR|EWHC|EWCA|UKSC|Privy\s*Council|PC|JCA|JCA\s*\d{4}|WLR|All\s*ER)\b",
-    re.IGNORECASE
-)
+# Heuristics:
+# - Many entries look like: "Case Title , [2014] JCA 095 , ..." or "... [1990] 1 AC 109"
+# - We try to pick the last [YEAR] block as 'year' and then the token(s) following it as 'citation'
+# - Jurisdiction inferred if tokens like JLR/JRC/JCA/JRB/RC appear → "Jersey"; else blank
 
-def looks_like_case(text: str) -> bool:
-    """Very light filter so we only capture real case rows."""
-    if " v " not in text and " V " not in text and " v. " not in text:
-        return False
-    if YEAR_IN_BRACKETS_RE.search(text):
-        return True
-    if CITATION_HINT_RE.search(text):
-        return True
-    return False
+YEAR_RX = re.compile(r"\[(\d{4})\]")
+# grab last [yyyy] and any immediately following report tokens (e.g., "JCA 095", "1 AC 109", etc.)
+CITATION_TAIL_RX = re.compile(r"\[(\d{4})\]\s*([^\],;]+(?:\s[^\],;]+)*)")
 
-def extract_title_and_citation(text: str):
-    """
-    Return (title, citation) where:
-      - title is column B style: case name trimmed, without trailing citations/pages
-      - citation is first [...] if present; otherwise empty
-    """
-    # Grab the first [....] block as a 'citation' if present
+def parse_row(text: str):
+    t = text.strip().strip(",;")
+    year = ""
     citation = ""
-    m = re.search(r"\[.*?]", text)
-    if m:
-        citation = m.group(0).strip()
+    title = t
 
-    # Strip any trailing ' , digits-digits' etc (page/range noise)
-    cleaned = re.sub(r"[,\s]*\d+(?:-\d+)?(?:,\s*\d+(?:-\d+)?)*\s*$", "", text).strip()
+    # find last [year]
+    years = list(YEAR_RX.finditer(t))
+    if years:
+        y_m = years[-1]
+        year = y_m.group(1)
 
-    # If there is a colon prefix (some lines are "N: …"), remove it
-    cleaned = re.sub(r"^[A-Za-z]\s*:\s*", "", cleaned).strip()
+        # Try to capture tail as citation
+        tail_m = CITATION_TAIL_RX.search(t[y_m.start():])
+        if tail_m and tail_m.group(1) == year:
+            citation = tail_m.group(0).strip()
+            # remove the citation chunk from title
+            title = (t[:y_m.start()] + t[y_m.start():].replace(citation, "", 1)).strip(" ,;")
+        else:
+            # keep year as citation if we can't find tail
+            citation = f"[{year}]"
+            title = (t[:y_m.start()] + t[y_m.start():].replace(f"[{year}]", "", 1)).strip(" ,;")
 
-    # If the text begins with the citation, keep the part before it as title; else take until citation
-    if citation:
-        parts = cleaned.split(citation, 1)
-        title = parts[0].strip().rstrip(",;")
-    else:
-        # If no citation, still try to trim at the end of a case-like bit (up to any bracket)
-        title = re.split(r"\s*\[", cleaned, 1)[0].strip().rstrip(",;")
+    # Clean repeated commas/spaces
+    title = re.sub(r"\s*,\s*$", "", title)
 
-    # Final tiny tidy
-    title = re.sub(r"\s+", " ", title)
+    juris = ""
+    if re.search(r"\b(JLR|JRC|JCA|RC Jersey|Royal Ct|Samedi|HB|JRB)\b", t, re.I):
+        juris = "Jersey"
 
-    return title, citation
-
-def slugify(s: str) -> str:
-    s = s.lower()
-    s = re.sub(r"[^a-z0-9]+", "_", s).strip("_")
-    return s
+    return title, year, citation, juris
 
 def main():
-    ap = argparse.ArgumentParser(description="Extract case titles from LTJ(LTK).lines.json")
-    ap.add_argument("--ltj-lines", required=True, help="Path to LTJ-ui/out/LTJ.lines.json (or LTK.lines.json)")
-    ap.add_argument("--start", type=int, required=True, help="Start line number (inclusive)")
-    ap.add_argument("--end", type=int, required=True, help="End line number (inclusive)")
-    ap.add_argument("--out", required=True, help="Output CSV path (e.g., data/cases.csv)")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lines", required=True, help="Path to LTJ-ui/out/LTJ.lines.json (or LTK.lines.json)")
+    ap.add_argument("--start", type=int, required=True)
+    ap.add_argument("--end", type=int, required=True)
+    ap.add_argument("--out", required=True, help="Output CSV (merged)")
     args = ap.parse_args()
 
-    lines_path = Path(args.ltj_lines)
-    if not lines_path.exists():
-        print(f"ERROR: lines JSON not found: {lines_path}", file=sys.stderr)
-        sys.exit(1)
+    lines_path = Path(args.lines)
+    out_csv = Path(args.out)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    # load existing to merge
+    existing = []
+    if out_csv.exists():
+        with out_csv.open("r", newline="", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                existing.append(row)
+
+    # de-dupe key set
+    seen = {(r.get("title",""), r.get("citation",""), r.get("source_line","")) for r in existing}
 
     with lines_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # data is expected to be a list of { "line_no": int, "text": str }
-    if not isinstance(data, list):
-        print("ERROR: lines JSON is not a list", file=sys.stderr)
-        sys.exit(1)
-
-    # Filter the requested range
-    subset = [row for row in data if isinstance(row, dict) and
-              "line_no" in row and "text" in row and
-              args.start <= int(row["line_no"]) <= args.end]
-
-    matched = []
-    for row in subset:
-        text = str(row["text"]).strip()
+    new_rows = []
+    for item in data:
+        ln = item.get("line_no")
+        if not isinstance(ln, int) or ln < args.start or ln > args.end:
+            continue
+        text = (item.get("text") or "").strip()
         if not text:
             continue
-        if not looks_like_case(text):
+
+        title, year, citation, juris = parse_row(text)
+        if not title and not citation:
             continue
-        title, citation = extract_title_and_citation(text)
-        if not title or " v " not in title.lower():
-            # If too aggressive, relax this guard.
-            continue
-        source_line = int(row["line_no"])
-        # case_id can be refined later; for now: slug(title) + optional year from citation
-        year = ""
-        m = re.search(r"\[(\d{4})]", citation)
-        if m:
-            year = m.group(1)
-        case_id = slugify(title + ("_" + year if year else ""))
 
-        matched.append({
-            "case_id": case_id,
-            "title": title,
-            "citation": citation,
-            "jurisdiction": "",     # filled later by enrichment
-            "url": "",               # filled later by enrichment
-            "source_line": source_line
-        })
+        row = {
+            "Title": title,
+            "Year": year,
+            "Citation": citation,
+            "Jurisdiction": juris,
+            "Line": str(ln),
+            "URL": "",
+        }
+        key = (row["Title"], row["Citation"], row["Line"])
+        if key not in seen:
+            new_rows.append(row)
+            seen.add(key)
 
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Write merged, ordered like your screenshot
+    headers = ["Title","Year","Citation","Jurisdiction","Line","URL"]
+    all_rows = existing if existing and set(existing[0].keys())==set(headers) else []
 
-    with out_path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["case_id", "title", "citation", "jurisdiction", "url", "source_line"])
+    # If the existing file had a different header, we re-normalize it
+    if not all_rows:
+        all_rows = []
+
+    all_rows.extend(new_rows)
+    # sort: primary Title, then Year, then Line (as int)
+    def _k(r):
+        y = int(r["Year"]) if r["Year"].isdigit() else 0
+        try:
+            ln = int(r["Line"])
+        except:
+            ln = 0
+        return (r["Title"].lower(), y, ln)
+
+    all_rows.sort(key=_k)
+
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
         w.writeheader()
-        for row in matched:
-            w.writerow(row)
+        for r in all_rows:
+            w.writerow(r)
 
-    print(f"Wrote {len(matched)} rows to {out_path}")
-    # Small debug preview
-    for row in matched[:5]:
-        print("  •", row["title"], row["citation"], f"(line {row['source_line']})")
+    print(f"Wrote {len(all_rows)} rows → {out_csv}")
 
 if __name__ == "__main__":
     main()
