@@ -1,44 +1,47 @@
 #!/usr/bin/env python3
-import csv, re, sys
+import argparse, csv, json, re
 from pathlib import Path
 
-CLEAN_COLS = ["Title","Year","Citation","Jurisdiction","Line","URL"]
+re_multi_space = re.compile(r'\s+')
+# Remove any residual ", 12-34" etc at end
+re_pages_tail = re.compile(r'\s*,\s*\d{1,3}(?:-\d{1,3})?(?:\s*,\s*\d{1,3}(?:-\d{1,3})?)*\s*$')
 
-def clean_title(raw):
-    """Strip trailing page references and clean citation."""
-    # Remove trailing commas/hyphens/numbers
-    clean = re.sub(r"[-, ]*\d+([-, ]*\d+)*$", "", raw).strip()
-    # Fix spacing before citation bracket if needed
-    clean = re.sub(r"\s+\[", " [", clean)
-    return clean
+def clean_title(title:str)->str:
+    t = re_pages_tail.sub('', title or '').strip(' ,;\u00a0')
+    t = re_multi_space.sub(' ', t).strip()
+    return t
 
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: clean_cases.py <input.csv> <output.csv>")
-        sys.exit(1)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--inp", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--report", required=True)
+    args = ap.parse_args()
 
-    infile = Path(sys.argv[1])
-    outfile = Path(sys.argv[2])
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    rpt = {"input": args.inp, "output": args.out, "changed": 0, "rows": 0}
 
-    with infile.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
+    rows_out = []
+    with open(args.inp, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            rpt["rows"] += 1
+            original = row["title"]
+            new = clean_title(original)
+            if new != original:
+                rpt["changed"] += 1
+            row["title"] = new
+            rows_out.append(row)
 
-    cleaned = []
-    for r in rows:
-        new_row = {}
-        for col in CLEAN_COLS:
-            new_row[col] = r.get(col, "").strip()
-        if new_row["Title"]:
-            new_row["Title"] = clean_title(new_row["Title"])
-        cleaned.append(new_row)
+    with open(args.out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=rows_out[0].keys())
+        w.writeheader()
+        w.writerows(rows_out)
 
-    with outfile.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CLEAN_COLS)
-        writer.writeheader()
-        writer.writerows(cleaned)
-
-    print(f"✅ Cleaned {len(cleaned)} cases → {outfile}")
+    Path(args.report).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.report, "w", encoding="utf-8") as f:
+        json.dump(rpt, f, indent=2)
+    print(json.dumps(rpt, indent=2))
 
 if __name__ == "__main__":
     main()
