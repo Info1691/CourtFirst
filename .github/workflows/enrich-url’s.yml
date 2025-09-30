@@ -1,0 +1,36 @@
+name: Enrich URLs for cases (DDG → JerseyLaw → BAILII)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out CourtFirst
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install beautifulsoup4 lxml
+
+      - name: Enrich URLs
+        run: |
+          python tools/enrich_urls.py data/cases.csv
+
+      - name: Commit enriched URLs
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Enrich URLs (jerseylaw/bailii preferred)"
+          file_pattern: data/cases.csv
