@@ -1,59 +1,138 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Pass-through URL normaliser.
-
-Input CSV (UTF-8) at --in must contain:
-  - case_id
-  - url   (the original source URL; we do NOT invent anything)
-
-Output:
-  out/cases_with_urls.csv  (case_id, source_url)
-  out/urls.json            (list of {case_id, source_url})
-
-We do not guess or fabricate. If a row lacks 'url', it is skipped and recorded.
-"""
-
+import argparse, csv, json, time, html
 from pathlib import Path
-import argparse
-from typing import List, Dict
+from urllib.parse import quote_plus
+import requests
+from bs4 import BeautifulSoup
 
-from tools.util import read_csv, write_csv, save_json, ensure_dir
+HEADERS = {"User-Agent":"Mozilla/5.0 (X11; Linux x86_64)"}
+TIMEOUT = 15
+
+def jerseylaw_search_urls(title, citation, year):
+    q = quote_plus(f'{title} {year or ""} {citation or ""}'.strip())
+    return [
+        f"https://www.jerseylaw.je/search/Pages/Results.aspx?k={q}",
+        f"https://www.jerseylaw.je/search/Pages/Results.aspx?k={quote_plus(title)}"
+    ]
+
+def bailii_search_urls(title, citation, year):
+    # Bailii’s search is basic; use DuckDuckGo site filter to find BAILII pages.
+    q1 = quote_plus(f'site:bailii.org "{title}" {year or ""}')
+    q2 = quote_plus(f'site:bailii.org "{title}"')
+    return [
+        f"https://duckduckgo.com/html/?q={q1}",
+        f"https://duckduckgo.com/html/?q={q2}",
+    ]
+
+def ddg_search_urls(title, citation, year):
+    q = quote_plus(f'"{title}" {year or ""} {citation or ""}')
+    return [f"https://duckduckgo.com/html/?q={q}"]
+
+def first_href_from_ddg(html_text):
+    soup = BeautifulSoup(html_text, "html.parser")
+    for a in soup.select("a.result__a"):
+        href = a.get("href")
+        if href:
+            return href
+    # Fallback older markup
+    a = soup.find("a", class_="result__a")
+    return a.get("href") if a else None
+
+def try_get(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
+        if r.status_code == 200 and r.text:
+            return r
+    except requests.RequestException:
+        return None
+    return None
+
+def resolve_url(title, citation, year, jurisdiction):
+    # 1) If Jersey likely, try JerseyLaw search page, then follow first result if simple
+    for url in jerseylaw_search_urls(title, citation, year):
+        r = try_get(url)
+        if not r: 
+            continue
+        soup = BeautifulSoup(r.text, "html.parser")
+        hit = soup.select_one("a.ms-srch-item-link, a[href*='/judgments/']")
+        if hit:
+            href = hit.get("href")
+            if href and href.startswith("/"):
+                return "https://www.jerseylaw.je" + href
+            if href and href.startswith("http"):
+                return href
+
+    # 2) Bailii via DDG site filtered
+    for url in bailii_search_urls(title, citation, year):
+        r = try_get(url)
+        if not r:
+            continue
+        href = first_href_from_ddg(r.text)
+        if href and "bailii.org" in href:
+            return href
+
+    # 3) General DDG
+    for url in ddg_search_urls(title, citation, year):
+        r = try_get(url)
+        if not r:
+            continue
+        href = first_href_from_ddg(r.text)
+        if href and href.startswith("http"):
+            return href
+
+    return ""
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in", dest="in_csv", required=True, help="Input CSV with 'case_id' and 'url'")
-    ap.add_argument("--outdir", dest="outdir", required=True, help="Output folder")
+    ap.add_argument("--inp", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--report", required=True)
+    ap.add_argument("--limit", type=int, default=0, help="limit rows for a run (0 = all)")
     args = ap.parse_args()
 
-    in_path = Path(args.in_csv)
-    outdir = Path(args.outdir)
-    ensure_dir(outdir)
+    rows = []
+    with open(args.inp, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        rows = list(r)
 
-    hmap, rows = read_csv(in_path)
-    miss = [k for k in ("case_id", "url") if k not in hmap]
-    if miss:
-        raise ValueError(f"Input CSV is missing required columns (case-insensitive): {miss}")
+    enriched = []
+    found = 0
+    tried = 0
+    for i, row in enumerate(rows, 1):
+        if args.limit and i > args.limit:
+            enriched.extend(rows[i-1:])
+            break
+        tried += 1
+        title = row.get("title","")
+        citation = row.get("citation","")
+        year = row.get("year","")
+        juris = row.get("jurisdiction","")
+        url = resolve_url(title, citation, year, juris)
+        if url:
+            found += 1
+            row["url"] = url
+        enriched.append(row)
+        time.sleep(0.6)  # be kind
 
-    out_rows: List[List[str]] = []
-    url_list: List[Dict[str, str]] = []
-    skipped: List[Dict[str, str]] = []
+    # Write output
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=enriched[0].keys())
+        w.writeheader()
+        w.writerows(enriched)
 
-    for row in rows:
-        case_id = row[hmap["case_id"]].strip()
-        url = row[hmap["url"]].strip()
-        if not case_id:
-            continue
-        if not url:
-            skipped.append({"case_id": case_id, "reason": "no url"})
-            continue
-        out_rows.append([case_id, url])
-        url_list.append({"case_id": case_id, "source_url": url})
-
-    write_csv(["case_id", "source_url"], out_rows, outdir / "cases_with_urls.csv")
-    save_json(url_list, outdir / "urls.json")
-    save_json(skipped, outdir / "skipped.json")
+    # Report
+    report = {
+        "input": args.inp,
+        "output": args.out,
+        "rows": len(rows),
+        "tried": tried,
+        "found": found
+    }
+    Path(args.report).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.report, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    print(json.dumps(report, indent=2))
 
 if __name__ == "__main__":
     main()
