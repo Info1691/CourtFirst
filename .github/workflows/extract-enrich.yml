@@ -1,38 +1,39 @@
+# .github/workflows/extract-enrich.yml
 name: Extract + Clean + Enrich (LTJ)
 
 on:
   workflow_dispatch:
     inputs:
-      ltj_lines_path:
-        description: 'Path to LTJ-ui/out/LTJ.lines.json'
+      ltj_ref:
+        description: 'LTJ-ui ref (branch or sha)'
         required: false
-        default: 'LTJ-ui/out/LTJ.lines.json'
+        default: main
       start_line:
-        description: 'Start line (inclusive)'
-        required: true
+        description: 'Start line (inclusive) in LTJ.lines.json'
+        required: false
         default: '1276'
       end_line:
-        description: 'End line (inclusive)'
-        required: true
-        default: '3083'
-      max_cases:
-        description: 'Cap for debug (0 = no cap)'
+        description: 'End line (inclusive) in LTJ.lines.json'
         required: false
-        default: '0'
+        default: '3083'
+      chunk_size:
+        description: 'How many rows per enrich chunk'
+        required: false
+        default: '400'
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Check out CourtFirst
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Check out LTJ-ui (private)
         uses: actions/checkout@v4
         with:
-          repository: Info1691/LTJ-ui
+          repository: ${{ github.repository_owner }}/LTJ-ui
+          ref: ${{ github.event.inputs.ltj_ref }}
           path: LTJ-ui
           token: ${{ secrets.LTJ_UI_TOKEN }}
 
@@ -44,43 +45,84 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 python-slugify
+          pip install --no-input -r requirements.txt || true
 
       - name: Prepare folders
         run: |
-          mkdir -p data out
+          mkdir -p out data
 
       - name: Extract cases (ALL)
+        env:
+          LTJ_LINES: LTJ-ui/out/LTJ.lines.json
+          OUT_CSV: data/cases.csv
+          START_LINE: ${{ github.event.inputs.start_line }}
+          END_LINE: ${{ github.event.inputs.end_line }}
         run: |
-          python tools/extract_cases_from_ltj.py \
-            --ltj-lines "${{ github.event.inputs.ltj_lines_path }}" \
-            --start ${{ github.event.inputs.start_line }} \
-            --end ${{ github.event.inputs.end_line }} \
-            --out data/cases_raw.csv \
-            --max ${{ github.event.inputs.max_cases }}
+          python tools/extract_cases_from_lines.py
+          echo "Extracted rows: $(wc -l < data/cases.csv)"
 
       - name: Clean titles safely (no drops)
         run: |
-          python tools/clean_cases.py \
-            --inp data/cases_raw.csv \
-            --out data/cases_clean.csv \
-            --report out/clean_report.json
+          python - << 'PY'
+          import csv, re
+          fn="data/cases.csv"
+          PIN = re.compile(r"(,\s*\d+(?:-\d+)?(?:,\s*\d+(?:-\d+)?)*)\s*$")
+          rows=[]
+          with open(fn,encoding="utf-8") as f:
+              r=csv.DictReader(f)
+              for row in r:
+                  t=(row.get("Title") or "")
+                  t=PIN.sub("", t).strip().rstrip(",")
+                  row["Title"]=t
+                  rows.append(row)
+          with open(fn,"w",newline="",encoding="utf-8") as f:
+              w=csv.DictWriter(f, fieldnames=rows[0].keys())
+              w.writeheader(); w.writerows(rows)
+          print(f"Cleaned: {len(rows)}")
+PY
 
-      - name: Enrich with real URLs (JerseyLaw → BAILII → DDG)
+      - name: Split into chunks
+        id: chunk
         run: |
-          python tools/enrich_sources.py \
-            --inp data/cases_clean.csv \
-            --out data/cases.csv \
-            --report out/enrich_report.json \
-            --limit 0
+          python - << 'PY'
+          import csv, math, os, json
+          size = int(os.environ.get("CHUNK_SIZE","400"))
+          rows=[]
+          with open("data/cases.csv", encoding="utf-8") as f:
+              r=csv.DictReader(f); rows=list(r)
+          n=len(rows)
+          chunks = [[i, min(i+size-1, n-1)] for i in range(0,n,size)]
+          os.makedirs("out", exist_ok=True)
+          with open("out/chunks.json","w") as f: json.dump(chunks,f)
+          print("CHUNKS="+json.dumps(chunks))
+PY
+        env:
+          CHUNK_SIZE: ${{ github.event.inputs.chunk_size }}
+
+      - name: Enrich with real URLs (JerseyLaw > BAILII > DDG)
+        run: |
+          set -e
+          python - << 'PY'
+          import json, os, subprocess, sys
+          with open("out/chunks.json") as f:
+              chunks=json.load(f)
+          for start,end in chunks:
+              print(f"== Enriching window {start}-{end} ==")
+              env=os.environ.copy()
+              env["IN_CSV"]="data/cases.csv"
+              env["OUT_DIR"]="out"
+              env["START_INDEX"]=str(start)
+              env["END_INDEX"]=str(end)
+              subprocess.run([sys.executable,"tools/enrich_sources.py"], check=True, env=env)
+PY
 
       - name: Upload artifacts (CSV + reports)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cases-and-reports
+          name: cases-output
           path: |
-            data/cases_raw.csv
-            data/cases_clean.csv
-            data/cases.csv
-            out/clean_report.json
-            out/enrich_report.json
+            out/cases_enriched.csv
+            out/*.json
+            out/*.log
+            out/checkpoints/**
