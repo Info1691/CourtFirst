@@ -1,41 +1,52 @@
-# .github/workflows/extract-enrich.yml
 name: Extract + Clean + Enrich (LTJ)
 
 on:
   workflow_dispatch:
     inputs:
       ltj_ref:
-        description: 'LTJ-ui ref (branch or sha)'
+        description: 'LTJ-ui ref (branch, tag, or SHA)'
         required: false
         default: main
       start_line:
-        description: 'Start line (inclusive) in LTJ.lines.json'
+        description: 'Start line (inclusive) in LTJ.lines.json (leave blank for ALL)'
         required: false
-        default: '1276'
+        default: ''
       end_line:
-        description: 'End line (inclusive) in LTJ.lines.json'
+        description: 'End line (inclusive) in LTJ.lines.json (leave blank for ALL)'
         required: false
-        default: '3083'
-      chunk_size:
-        description: 'How many rows per enrich chunk'
-        required: false
-        default: '400'
+        default: ''
 
 jobs:
   build:
+    name: build
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      contents: write   # needed to push the updated CSV back to CourtFirst
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      OUT_DIR: out
+      DATA_DIR: data
+      CASES_CSV: data/cases.csv
+
     steps:
+      - name: Set up job
+        run: echo "Starting workflow…"
+
       - name: Check out CourtFirst
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Check out LTJ-ui (private)
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/LTJ-ui
-          ref: ${{ github.event.inputs.ltj_ref }}
-          path: LTJ-ui
           token: ${{ secrets.LTJ_UI_TOKEN }}
+          ref: ${{ inputs.ltj_ref }}
+          path: LTJ-ui
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -45,84 +56,189 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install --no-input -r requirements.txt || true
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # lightweight HTML + parsing helpers if not listed in requirements.txt
+          pip install requests beautifulsoup4 lxml duckduckgo-search==5.*
 
       - name: Prepare folders
         run: |
-          mkdir -p out data
+          mkdir -p "${OUT_DIR}"
+          mkdir -p "$(dirname "${CASES_CSV}")"
 
-      - name: Extract cases (ALL)
-        env:
-          LTJ_LINES: LTJ-ui/out/LTJ.lines.json
-          OUT_CSV: data/cases.csv
-          START_LINE: ${{ github.event.inputs.start_line }}
-          END_LINE: ${{ github.event.inputs.end_line }}
+      # -------- EXTRACT --------
+      - name: Extract cases (ALL or bounded range)
         run: |
-          python tools/extract_cases_from_lines.py
-          echo "Extracted rows: $(wc -l < data/cases.csv)"
+          echo "::group::Extract"
+          python - << 'PY'
+          import json, csv, re, sys, os
+          from pathlib import Path
 
+          start_line = os.getenv('START_LINE')
+          end_line   = os.getenv('END_LINE')
+          start_line = int(start_line) if start_line and start_line.strip() else None
+          end_line   = int(end_line)   if end_line   and end_line.strip()   else None
+
+          ltj_lines_path = Path("LTJ-ui/out/LTJ.lines.json")
+          if not ltj_lines_path.exists():
+            print(f"ERROR: {ltj_lines_path} not found", file=sys.stderr)
+            sys.exit(2)
+
+          with ltj_lines_path.open('r', encoding='utf-8') as f:
+            lines = json.load(f)
+
+          # rows -> dicts with Title / Year / Citation / Line
+          out_rows = []
+          line_re = re.compile(r'^\s*(?P<title>.+?)\s*,\s*(?P<year>\[\d{4}\]|\(\d{4}\)|\d{4})\s*,\s*(?P<citation>.+?)\s*$')
+          # Accept entries that are clearly case lines; skip pure page ranges like "12-23"
+          def looks_like_case(s: str) -> bool:
+            # skip obvious page lists like "9-12, 9-18"
+            if re.fullmatch(r'[\d,\-\sVLRCWlracA\-]+', s):
+              return False
+            # allow titles with v / Re / In re etc.
+            return bool(re.search(r'\bv\b|\bRe\b|\bIn re\b', s, flags=re.I)) or bool(re.search(r'\[\d{4}\]|\(\d{4}\)', s))
+
+          for obj in lines:
+            ln = obj.get("line_no")
+            text = obj.get("text","").strip()
+            if not text:
+              continue
+            if start_line and ln < start_line:
+              continue
+            if end_line and ln > end_line:
+              continue
+            if not looks_like_case(text):
+              continue
+
+            # Split trailing "…, [year], citation" if present, but fall back gracefully
+            m = line_re.match(text)
+            if m:
+              title = m.group("title").strip()
+              year  = m.group("year").strip()
+              citation = m.group("citation").strip()
+            else:
+              # fallback: try to peel off a trailing bracketed citation
+              title, year, citation = text, "", ""
+              tail = re.search(r'(.*?)(\[\d{4}\]|\(\d{4}\))(.*)$', text)
+              if tail:
+                title = tail.group(1).strip().rstrip(',;:')
+                year = tail.group(2)
+                citation = tail.group(3).strip(' ,;')
+
+            out_rows.append({
+              "Title": title,
+              "Year": year.strip("[]()"),
+              "Citation": citation,
+              "Line": ln
+            })
+
+          # merge with existing CSV if present
+          csv_path = Path(os.environ["CASES_CSV"])
+          existing = []
+          if csv_path.exists():
+            with csv_path.open('r', encoding='utf-8', newline='') as f:
+              r = csv.DictReader(f)
+              for row in r:
+                existing.append(row)
+
+          # build index by (Title, Year, Citation, Line)
+          key = lambda r: (r.get("Title",""), r.get("Year",""), r.get("Citation",""), str(r.get("Line","")))
+          have = { key(r): r for r in existing }
+          for r in out_rows:
+            have[key(r)] = {
+              "Title": r["Title"],
+              "Year": r["Year"],
+              "Citation": r["Citation"],
+              "Jurisdiction": "",   # filled later
+              "URL": "",            # filled later
+              "Line": r["Line"]
+            }
+
+          final = list(have.values())
+          final.sort(key=lambda r: int(r["Line"]))
+
+          csv_path.parent.mkdir(parents=True, exist_ok=True)
+          with csv_path.open('w', encoding='utf-8', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=["Title","Year","Citation","Jurisdiction","URL","Line"])
+            w.writeheader()
+            w.writerows(final)
+
+          print(f"Wrote {len(final)} rows to {csv_path}")
+          PY
+          echo "::endgroup::"
+        env:
+          START_LINE: ${{ inputs.start_line }}
+          END_LINE:   ${{ inputs.end_line }}
+
+      # -------- CLEAN (TITLE NORMALISATION, no drops) --------
       - name: Clean titles safely (no drops)
         run: |
+          echo "::group::Clean"
           python - << 'PY'
           import csv, re
-          fn="data/cases.csv"
-          PIN = re.compile(r"(,\s*\d+(?:-\d+)?(?:,\s*\d+(?:-\d+)?)*)\s*$")
-          rows=[]
-          with open(fn,encoding="utf-8") as f:
-              r=csv.DictReader(f)
-              for row in r:
-                  t=(row.get("Title") or "")
-                  t=PIN.sub("", t).strip().rstrip(",")
-                  row["Title"]=t
-                  rows.append(row)
-          with open(fn,"w",newline="",encoding="utf-8") as f:
-              w=csv.DictWriter(f, fieldnames=rows[0].keys())
-              w.writeheader(); w.writerows(rows)
-          print(f"Cleaned: {len(rows)}")
-PY
+          from pathlib import Path
+          p = Path("${{ env.CASES_CSV }}")
+          rows = []
+          with p.open('r', encoding='utf-8', newline='') as f:
+            r = csv.DictReader(f)
+            for row in r:
+              t = row["Title"]
+              # strip common trailing page ranges / commas left over
+              t = re.sub(r'\s*\(\s*Ch\s*\)\s*', ' (Ch)', t)   # normalise (Ch)
+              t = re.sub(r'\s+,\s*$', '', t)
+              # remove obvious page/section tails like "…, 9-12, 9-18"
+              t = re.sub(r'(?:,\s*)?\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*\s*$', '', t)
+              # collapse whitespace
+              t = re.sub(r'\s{2,}', ' ', t).strip()
+              row["Title"] = t
+              rows.append(row)
 
-      - name: Split into chunks
-        id: chunk
+          with p.open('w', encoding='utf-8', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=["Title","Year","Citation","Jurisdiction","URL","Line"])
+            w.writeheader()
+            w.writerows(rows)
+          print(f"Cleaned titles in {p}")
+          PY
+          echo "::endgroup::"
+
+      # -------- ENRICH (JerseyLaw -> BAILII -> DDG) --------
+      - name: Enrich with real URLs (JerseyLaw ➜ BAILII ➜ DDG)
         run: |
-          python - << 'PY'
-          import csv, math, os, json
-          size = int(os.environ.get("CHUNK_SIZE","400"))
-          rows=[]
-          with open("data/cases.csv", encoding="utf-8") as f:
-              r=csv.DictReader(f); rows=list(r)
-          n=len(rows)
-          chunks = [[i, min(i+size-1, n-1)] for i in range(0,n,size)]
-          os.makedirs("out", exist_ok=True)
-          with open("out/chunks.json","w") as f: json.dump(chunks,f)
-          print("CHUNKS="+json.dumps(chunks))
-PY
-        env:
-          CHUNK_SIZE: ${{ github.event.inputs.chunk_size }}
+          echo "::group::Enrich"
+          python tools/enrich_sources.py --input "${{ env.CASES_CSV }}" --out-dir "${{ env.OUT_DIR }}"
+          echo "::endgroup::"
 
-      - name: Enrich with real URLs (JerseyLaw > BAILII > DDG)
-        run: |
-          set -e
-          python - << 'PY'
-          import json, os, subprocess, sys
-          with open("out/chunks.json") as f:
-              chunks=json.load(f)
-          for start,end in chunks:
-              print(f"== Enriching window {start}-{end} ==")
-              env=os.environ.copy()
-              env["IN_CSV"]="data/cases.csv"
-              env["OUT_DIR"]="out"
-              env["START_INDEX"]=str(start)
-              env["END_INDEX"]=str(end)
-              subprocess.run([sys.executable,"tools/enrich_sources.py"], check=True, env=env)
-PY
-
+      # -------- ARTIFACTS --------
       - name: Upload artifacts (CSV + reports)
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cases-output
+          name: courtfirst-enriched
           path: |
-            out/cases_enriched.csv
-            out/*.json
-            out/*.log
-            out/checkpoints/**
+            ${{ env.CASES_CSV }}
+            ${{ env.OUT_DIR }}/**/*
+          if-no-files-found: warn
+          retention-days: 7
+
+      # -------- COMMIT BACK --------
+      - name: Commit updated CSV into CourtFirst
+        run: |
+          if ! git diff --quiet -- "${{ env.CASES_CSV }}"; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "${{ env.CASES_CSV }}"
+            git commit -m "Update cases.csv via Extract+Clean+Enrich (LTJ ref: ${{ inputs.ltj_ref }})"
+            git push
+          else
+            echo "No changes to commit."
+          fi
+
+      - name: Post Set up Python
+        if: always()
+        run: python -V
+
+      - name: Post Check out LTJ-ui (private)
+        if: always()
+        run: echo "Done with LTJ-ui."
+
+      - name: Post Check out CourtFirst
+        if: always()
+        run: echo "Done with CourtFirst."
