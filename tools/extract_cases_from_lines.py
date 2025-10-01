@@ -1,42 +1,45 @@
-# tools/extract_cases_from_lines.py
-import json, os, re, csv, sys
-from util import write_csv
+#!/usr/bin/env python3
+import argparse, json, re, csv
 
-IN_LINES = os.environ.get("LTJ_LINES", "LTJ-ui/out/LTJ.lines.json")
-OUT_CSV  = os.environ.get("OUT_CSV", "data/cases.csv")
-START = int(os.environ.get("START_LINE", "1276"))
-END   = int(os.environ.get("END_LINE", "3083"))
+CASE_LINE = re.compile(r'"text"\s*:\s*"(?P<title>.+?)"\s*}\s*[,}]')
+YEAR = re.compile(r'\[(\d{4})\]')
+CITE = re.compile(r'(\[[0-9]{4}\].+?|[A-Z]{2,4}\s?[0-9]{3,5}.+?)$')
 
-PINPOINT = re.compile(r"(,\s*\d+(?:-\d+)?(?:,\s*\d+(?:-\d+)?)*)\s*$")  # trailing “, 12-23, 45-47”
-YEAR = re.compile(r"\[(\d{4})\]|\((\d{4})\)")
-
-def clean_title(s:str)->str:
-    s = PINPOINT.sub("", s).strip()
-    return s
-
-def guess_year(s:str)->str:
-    m = YEAR.search(s or "")
-    if not m: return ""
-    return m.group(1) or m.group(2) or ""
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lines", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--start", type=int, default=1)
+    ap.add_argument("--end", type=int, default=10**9)
+    return ap.parse_args()
 
 def main():
-    with open(IN_LINES, encoding="utf-8") as f:
-        lines = json.load(f)
+    a = parse_args()
+    with open(a.lines, "r", encoding="utf-8") as f:
+        lines = f.readlines()
 
-    rows=[]
-    for item in lines:
-        ln = item.get("line_no") or item.get("line") or item.get("line_no".upper())
-        txt = item.get("text","").strip()
-        if not isinstance(ln, int): continue
-        if ln < START or ln > END: continue
-        if not txt: continue
+    rows = []
+    for i, line in enumerate(lines, start=1):
+        if i < a.start or i > a.end: continue
+        m = CASE_LINE.search(line)
+        if not m: continue
+        title_raw = m.group("title").strip()
+        year = ""
+        y = YEAR.search(title_raw)
+        if y: year = y.group(1)
+        citation = ""
+        c = CITE.search(title_raw)
+        if c: citation = c.group(1).strip().rstrip('",')
+        rows.append({
+            "Title": title_raw,
+            "Year": year,
+            "Citation": citation
+        })
 
-        title = clean_title(txt)
-        yr = guess_year(txt)
-        rows.append({"Title": title, "Year": yr, "Citation":"", "Jurisdiction":"", "Source_Line": ln})
+    with open(a.out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["Title","Year","Citation"])
+        w.writeheader()
+        w.writerows(rows)
 
-    write_csv(OUT_CSV, rows, ["Title","Year","Citation","Jurisdiction","Source_Line"])
-    print(f"Wrote {len(rows)} rows to {OUT_CSV}")
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
