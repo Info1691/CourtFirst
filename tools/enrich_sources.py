@@ -1,136 +1,87 @@
-# tools/enrich_sources.py
-"""
-Enrich cases with best-guess public URLs.
-Priority:
-  1) JerseyLaw (if looks like a Jersey citation/title)
-  2) BAILII (generic UK-style citations)
-  3) DuckDuckGo query URL as fallback (no fabrication)
+#!/usr/bin/env python3
+import argparse, csv, re, time, random
+from duckduckgo_search import DDGS
+import urllib.parse as ul
 
-- Heartbeat every 25 rows.
-- Checkpoint every 200 rows -> out/checkpoints/enrich_progress_*.json
-- Chunked processing via START_INDEX, END_INDEX env vars (inclusive 0-based).
+JERSEYLAW_ROOT = "https://www.jerseylaw.je"
+BAILII_ROOT = "https://www.bailii.org"
 
-Inputs:
-  data/cases.csv (must have columns: Title, Year, Citation; optional Jurisdiction)
-Outputs:
-  out/cases_enriched.csv
-  out/enrich_report.json
-  out/heartbeat.log
-  out/checkpoints/...
-"""
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--out", required=True)
+    return ap.parse_args()
 
-import os, re, sys, json
-from typing import Dict, Any, List
-from util import (read_csv, write_csv, save_json, load_json,
-                  Heartbeat, build_queries, try_get, ddg_search_url, sleep_jitter)
+def heartbeat(n_done, total):
+    if n_done % 50 == 0 or n_done == total:
+        rate = f"{n_done}/{total} (~{(n_done/total)*100:.1f}%)"
+        print(f"[enrich] {rate}")
 
-IN_CSV = os.environ.get("IN_CSV", "data/cases.csv")
-OUT_DIR = os.environ.get("OUT_DIR", "out")
-OUT_CSV = os.path.join(OUT_DIR, "cases_enriched.csv")
-REPORT = os.path.join(OUT_DIR, "enrich_report.json")
-CHECK_DIR = os.path.join(OUT_DIR, "checkpoints")
-os.makedirs(CHECK_DIR, exist_ok=True)
+def try_jerseylaw(title, year):
+    # very light heuristic: if looks like "JRC 123" or "JCA 123"
+    if "JRC" in title or "JCA" in title:
+        q = f'site:jerseylaw.je "{title}"'
+        return ddg_first(q)
+    return ""
 
-START_INDEX = int(os.environ.get("START_INDEX", "0"))
-END_INDEX   = os.environ.get("END_INDEX")  # inclusive; if None -> all
-END_INDEX = None if END_INDEX in (None,"") else int(END_INDEX)
+def try_bailii(title, year):
+    q = f'site:bailii.org "{title}"'
+    u = ddg_first(q)
+    if u: return u
+    # fallback: add year if we have one
+    if year:
+        return ddg_first(f'site:bailii.org "{title}" {year}')
+    return ""
 
-JERSEY_HINT = re.compile(r"\bJERSEY\b|\bJRC\b|\bJLR\b", re.I)
-UK_HINT     = re.compile(r"\bUKSC\b|\bEWCA\b|\bEWHC\b|\bWLR\b|\bAll ER\b", re.I)
+def ddg_first(query):
+    with DDGS() as ddgs:
+        for r in ddgs.text(query, max_results=3):
+            url = r.get("href") or r.get("url")
+            if url: return url
+    return ""
 
-def jersey_candidate(q:str)->str:
-    # Search page on jersey law, not scraping results:
-    return f"https://www.jerseylaw.je/?s={q.replace(' ', '+')}"
-
-def bailii_candidate(q:str)->str:
-    return f"https://www.bailii.org/cgi-bin/sino_search_1.cgi?search={q.replace(' ','+')}"
-
-def best_url_for(title:str, citation:str, jurisdiction:str) -> Dict[str,str]:
-    # We do NOT fabricate final URLs. We record a “likely search URL” on official sites.
-    queries = build_queries(title, citation, jurisdiction)
-    # Prefer Jerseylaw if looks Jersey-ish:
-    if any(JERSEY_HINT.search(x or "") for x in [citation, jurisdiction, title]):
-        return {"source_hint":"JerseyLaw", "url": jersey_candidate(queries[0]), "via":"search"}
-    # Prefer BAILII for UK-style:
-    if any(UK_HINT.search(x or "") for x in [citation, title]):
-        return {"source_hint":"BAILII", "url": bailii_candidate(queries[0]), "via":"search"}
-    # Fallback to DDG
-    return {"source_hint":"DDG", "url": ddg_search_url(queries[0]), "via":"search"}
+def polite_sleep():
+    time.sleep(0.4 + random.random()*0.3)
 
 def main():
-    rows = read_csv(IN_CSV)
-    n = len(rows)
-    if END_INDEX is None: end = n-1
-    else: end = min(END_INDEX, n-1)
-    start = max(0, min(START_INDEX, end))
+    a = parse_args()
+    rows = []
+    with open(a.input, newline="", encoding="utf-8") as f:
+        r = list(csv.DictReader(f))
+    total = len(r)
+    for i, row in enumerate(r, start=1):
+        title = row["Title"]
+        year = row.get("Year","").strip()
+        url = ""
 
-    work = rows[start:end+1]
-    hb = Heartbeat(total=len(work), every=25, out_dir=OUT_DIR, name="enrich")
+        # JerseyLaw first
+        url = try_jerseylaw(title, year)
+        polite_sleep()
+        if not url:
+            # BAILII then
+            url = try_bailii(title, year)
+            polite_sleep()
+        if not url:
+            # broad duckduckgo
+            q = f'"{title}" {year}' if year else f'"{title}"'
+            url = ddg_first(q)
+            polite_sleep()
 
-    # load previous checkpoint if any (by index window)
-    ck_name = os.path.join(CHECK_DIR, f"enrich_progress_{start}_{end}.json")
-    progress = load_json(ck_name, {"done":0, "items":[]})
-    enriched: List[Dict[str,Any]] = progress.get("items", [])
-    done = progress.get("done", 0)
+        row_out = {
+            "Title": title,
+            "Year": year,
+            "Citation": row.get("Citation",""),
+            "Jurisdiction": "Jersey" if "JRC" in title or "JCA" in title else "",
+            "URL": url
+        }
+        rows.append(row_out)
+        heartbeat(i, total)
 
-    report = {
-        "window": {"start": start, "end": end, "total": len(work)},
-        "counts": {"jersey":0, "bailii":0, "ddg":0},
-        "errors": []
-    }
+    # write back into the main spreadsheet the UI uses
+    with open(a.out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["Title","Year","Citation","Jurisdiction","URL"])
+        w.writeheader()
+        w.writerows(rows)
 
-    # resume position
-    idx0 = start + done
-
-    for i in range(idx0, end+1):
-        row = rows[i]
-        title = row.get("Title","").strip()
-        year  = row.get("Year","").strip()
-        cit   = row.get("Citation","").strip()
-        jur   = row.get("Jurisdiction","").strip()
-
-        if not title:
-            report["errors"].append({"i":i, "reason":"missing_title"})
-            enriched.append({**row, "source_hint":"", "url":""})
-            done += 1; hb.tick(); continue
-
-        try:
-            best = best_url_for(title, cit, jur)
-            hint = best.get("source_hint","")
-            if hint=="JerseyLaw": report["counts"]["jersey"] += 1
-            elif hint=="BAILII": report["counts"]["bailii"] += 1
-            else: report["counts"]["ddg"] += 1
-
-            enriched.append({**row,
-                             "url": best["url"],
-                             "source_hint": best["source_hint"],
-                             "via": best["via"]})
-        except Exception as e:
-            report["errors"].append({"i":i, "title":title, "err":str(e)})
-            enriched.append({**row, "source_hint":"", "url":""})
-
-        done += 1
-        hb.tick()
-
-        # checkpoint every 200
-        if done % 200 == 0 or i==end:
-            save_json(ck_name, {"done":done, "items":enriched})
-
-        # be polite
-        sleep_jitter(0.3, 0.4)
-
-    # merge back into full set so downstream files stay simple
-    out_rows = rows[:]
-    out_rows[start:end+1] = enriched
-
-    write_csv(OUT_CSV, out_rows,
-              fieldnames=list(out_rows[0].keys()) + ["url","source_hint","via"] if out_rows else
-              ["Title","Year","Citation","Jurisdiction","url","source_hint","via"])
-
-    save_json(REPORT, report)
-    print(f"Enriched window {start}-{end}. Jersey:{report['counts']['jersey']}  "
-          f"BAILII:{report['counts']['bailii']}  DDG:{report['counts']['ddg']}")
-    print(f"Wrote {OUT_CSV} and {REPORT}")
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
