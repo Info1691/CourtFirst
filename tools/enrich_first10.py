@@ -60,7 +60,7 @@ DEFAULT_ABORT_AFTER = 8  # abort if we see this many consecutive “skips”
 
 # ---------- Helpers ----------
 
-ROMAN_RE = re.compile(r"^(?i)(?:[ivxlcdm]+)\.?$")         # e.g. xxxvii
+ROMAN_RE = re.compile(r"(?i)^(?:[ivxlcdm]+)\.?$")  # e.g. xxxvii
 BLANKISH_RE = re.compile(r"^\s*$")
 SECTIONY_RE = re.compile(r"^[A-Z]\.\s")                   # e.g. "B. The Rule ..."
 NONCASE_LEADERS = (
