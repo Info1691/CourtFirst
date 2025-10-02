@@ -1,12 +1,11 @@
 # tools/enrich_first10.py
 """
-Take the first N cases from data/cases.csv and attempt to attach a DIRECT judgment URL
-(prefer jerseylaw.je, then bailii.org, then DDG fallback).
-Emits three artifacts into out/preview-enrichment/:
-  - cases_preview.csv  (Title,Citation,url)
-  - urls_preview.json  (diagnostics per row)
-  - skipped_preview.json (rows where we could not verify a direct link)
-Shows a heartbeat line for each processed case and aborts after max consecutive failures.
+Process the first N rows of data/cases.csv and attach a DIRECT judgment URL.
+Artifacts written to out/preview-enrichment/:
+  - cases_preview.csv (Title,Citation,url)
+  - urls_preview.json  (per-row diagnostics)
+  - skipped_preview.json (rows without verified direct link)
+Includes a heartbeat line per case and aborts after too many consecutive failures.
 """
 import csv
 import json
@@ -26,8 +25,7 @@ SLEEP_MAX = float(os.environ.get("SLEEP_MAX", "3.5"))
 def read_cases_csv(path: str) -> List[Dict[str, str]]:
     with open(path, newline="", encoding="utf-8") as f:
         rdr = csv.DictReader(f)
-        rows = [dict((k or "").strip(), v) for k, v in row.items()] if False else list(rdr)  # normalize keys minimal
-        return rows
+        return list(rdr)
 
 def ensure_outdir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -57,6 +55,7 @@ def main() -> int:
 
     for idx in range(total):
         r = rows[idx]
+        # Accept either Title/Citation or title/citation (robust to header case)
         title = (r.get("Title") or r.get("title") or "").strip()
         citation = (r.get("Citation") or r.get("citation") or "").strip()
 
@@ -69,33 +68,26 @@ def main() -> int:
             skipped[idx] = {"title": title, "citation": citation, "reason": "no-verified-direct-link", **diags}
             consec_fail += 1
 
-        # Heartbeat
         done = idx + 1
-        rate = done / max(1.0, (done * (SLEEP_MIN + SLEEP_MAX) / 2.0))  # rough & friendly
-        ok_count = len(ok_rows)
         print(
-            f"[heartbeat] case {done}/{total} | ok:{ok_count} skip:{len(skipped)} | ~{rate:.2f} cases/s | title='{title[:48]}'",
+            f"[heartbeat] case {done}/{total} | ok:{len(ok_rows)} skip:{len(skipped)} | title='{title[:60]}'",
             flush=True,
         )
 
-        # abort on too many consecutive failures
         if consec_fail >= ABORT_AFTER:
             print(f"!! aborting: {consec_fail} consecutive failures (max {ABORT_AFTER})", flush=True)
             break
 
         sleep_jitter(SLEEP_MIN, SLEEP_MAX)
 
-    # write artifacts
     write_cases_preview(ok_rows, os.path.join(OUTDIR, "cases_preview.csv"))
     write_json(diagnostics, os.path.join(OUTDIR, "urls_preview.json"))
     write_json(skipped, os.path.join(OUTDIR, "skipped_preview.json"))
 
     print(
-        f"Done. Success={len(ok_rows)} Skipped={len(skipped)} "
-        f"Elapsed~heartbeat only. Artifacts in {OUTDIR}",
+        f"Done. Success={len(ok_rows)} Skipped={len(skipped)}  Artifacts -> {OUTDIR}",
         flush=True,
     )
-    # signal non-zero if nothing was found to ensure we fix queries before scaling
     return 0 if ok_rows else 2
 
 if __name__ == "__main__":
