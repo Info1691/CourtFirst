@@ -1,0 +1,61 @@
+name: Preview enrich (first 5 with heartbeat)
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Start index in data/cases.csv"
+        default: "0"
+      end:
+        description: "End index (exclusive) – ignored if limit is set"
+        default: "5"
+      limit:
+        description: "Limit rows (overrides end if set). Leave empty to use start/end."
+        default: ""
+      sleep_min:
+        description: "Min sleep between queries"
+        default: "2.0"
+      sleep_max:
+        description: "Max sleep between queries"
+        default: "4.0"
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out CourtFirst
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+            python-version: "3.11"
+
+      - name: Install deps (polite)
+        run: |
+          python -m pip install --upgrade pip
+          # ddg lib is optional; script will still work without it
+          pip install duckduckgo_search==5.3.1
+
+      - name: Run preview (no repo writes)
+        env:
+          # purely cosmetic heartbeat rate (optional)
+          HEART_RATE: "≈1.0"
+        run: |
+          python tools/enrich_preview.py \
+            --input data/cases.csv \
+            --start "${{ github.event.inputs.start || 0 }}" \
+            --end   "${{ github.event.inputs.end   || 5 }}" \
+            $( [ -n "${{ github.event.inputs.limit }}" ] && echo --limit "${{ github.event.inputs.limit }}" ) \
+            --sleep-min "${{ github.event.inputs.sleep_min || 2.0 }}" \
+            --sleep-max "${{ github.event.inputs.sleep_max || 4.0 }}" \
+            --outdir out/preview
+
+      - name: Upload preview artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-enrichment
+          path: |
+            out/preview/cases_preview.csv
+            out/preview/urls_preview.json
+            out/preview/skipped_preview.json
