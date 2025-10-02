@@ -2,316 +2,258 @@
 # -*- coding: utf-8 -*-
 
 """
-Enrich the first N (or a given window) of cases with *candidate* source URLs
-without performing any HTML fetching. Pure standard library; safe for GHA.
+Enrich first N cases (preview + heartbeat).
 
-Outputs three artifacts under --outdir:
-- cases_preview.csv        (Title, Citation, Url)               <- single chosen URL per row
-- urls_preview.json        (all candidate URLs & query per row) <- for inspection
-- skipped_preview.json     (rows we skipped and why)
+Reads the first N (default 10) rows from data/cases.csv (columns: Title, Year, Citation, …),
+builds search queries, opens the Jerseylaw/Bailli site **search pages**, parses the
+results, follows the first result to the **actual case page**, and writes a preview CSV
+with columns: Title, Citation, url.
 
-Heartbeat logs progress per row (rate, ok/skips).
+No writes to data/cases.csv – this is a safe preview pass.
 
 Usage examples:
-  python tools/enrich_first10.py --input data/cases.csv --outdir out/preview-enrichment --limit 10
+  python tools/enrich_first10.py --input data/cases.csv --outdir out/preview-enrichment
+  python tools/enrich_first10.py --input data/cases.csv --outdir out/preview-enrichment --limit 20
   python tools/enrich_first10.py --input data/cases.csv --outdir out/preview-enrichment --start 10 --limit 20
+
+Heartbeat: prints per-case progress and rate.
 """
 
 from __future__ import annotations
-
 import argparse
 import csv
-import json
 import os
+import random
 import sys
 import time
-import urllib.parse
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Optional, Tuple
+from urllib.parse import quote_plus, urljoin
 
+import requests
+from bs4 import BeautifulSoup
 
-# --------------------------
-# Utilities (stdlib only)
-# --------------------------
+# ----------- HTTP helpers -----------
 
-def sleep_jitter(min_s: float, max_s: float) -> None:
-    """Light randomized backoff between iterations (optional, can be zeroed)."""
-    if max_s <= 0:
-        return
-    if min_s < 0:
-        min_s = 0.0
-    if max_s < min_s:
-        max_s = min_s
-    # deterministic-ish jitter that doesn't need random module
-    now = time.time()
-    frac = now - int(now)
-    delay = min_s + (max_s - min_s) * frac
-    time.sleep(delay)
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
+def _session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA, "Accept": "text/html,application/xhtml+xml"})
+    s.timeout = 30
+    return s
 
-def norm(s: str) -> str:
-    return (s or "").strip()
+def sleep_jitter(min_s: float, max_s: float):
+    time.sleep(random.uniform(min_s, max_s))
 
+def absolute(base: str, href: str) -> str:
+    return urljoin(base, href)
 
-def build_query(title: str, citation: str) -> str:
+# ----------- site resolvers -----------
+
+def jl_search_url(query: str) -> str:
+    # Current JLIB search endpoint for judgments (works with “k=” keyword param)
+    # They have moved things a few times; this variant is robust.
+    return f"https://www.jerseylaw.je/judgments/Pages/results.aspx?k={quote_plus(query)}"
+
+def bailii_search_url(query: str) -> str:
+    return f"https://www.bailii.org/cgi-bin/sino_search_1.cgi?query={quote_plus(query)}"
+
+def pick_best_url(candidate_urls: Dict[str, Optional[str]]) -> Optional[str]:
+    # Preference order: confirmed case page on JLIB, then confirmed BAILII case page,
+    # finally the search pages (as last resort).
+    for key in ("jlib_case", "bailii_case", "jlib_search", "bailii_search"):
+        u = candidate_urls.get(key)
+        if u:
+            return u
+    return None
+
+def resolve_jlib_case(s: requests.Session, title: str, citation: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Build a search query string. Keep it conservative (no fabrication).
-    Prefer "Title" + (year/citation tokens if present).
+    Return (case_page_url, search_url).
+    We search first, then try to click the top result (judgment page).
     """
-    t = norm(title)
-    c = norm(citation)
-    # bail out if no title
-    if not t:
-        return ""
-    # include citation only if looks like a bracketed year or reporter token
-    parts = [t]
-    if c:
-        # keep brief; many citations in your CSV already hold page ranges — harmless in search
-        parts.append(c)
-    return " ".join(parts)
+    query_bits = [title.strip()]
+    if citation:
+        query_bits.append(citation.strip())
+    q = " ".join(query_bits)
 
+    search_u = jl_search_url(q)
+    try:
+        r = s.get(search_u)
+        r.raise_for_status()
+    except Exception:
+        return (None, search_u)
 
-def bailii_search(query: str) -> str:
-    base = "https://www.bailii.org/cgi-bin/sino_search_1.cgi"
-    q = {"query": query}
-    return f"{base}?{urllib.parse.urlencode(q)}"
+    soup = BeautifulSoup(r.text, "html.parser")
 
+    # New JLIB search result layout: list of results with anchor tags under .results or similar.
+    # Heuristic: prefer anchors whose href contains '/judgments/' and NOT 'results.aspx'
+    link = None
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        text = " ".join(a.get_text(" ", strip=True).split())
+        if not href:
+            continue
+        # Prefer direct judgment pages
+        if "/judgments/" in href and "results.aspx" not in href:
+            link = absolute(search_u, href)
+            break
+    # Fallback: none found – keep only the search page
+    return (link, search_u)
 
-def jerseylaw_search(query: str) -> str:
-    # JL recently changed URLs; result search page still supports 'k=' parameter
-    base = "https://www.jerseylaw.je/search/Pages/Results.aspx"
-    q = {"k": query}
-    return f"{base}?{urllib.parse.urlencode(q)}"
-
-
-def ddg_open(query: str) -> str:
-    # general web search (open)
-    base = "https://duckduckgo.com/"
-    q = {"q": query}
-    return f"{base}?{urllib.parse.urlencode(q)}"
-
-
-def ddg_site(query: str, site: str) -> str:
-    base = "https://duckduckgo.com/"
-    q = {"q": f"site:{site} {query}"}
-    return f"{base}?{urllib.parse.urlencode(q)}"
-
-
-def choose_primary(title: str, citation: str, urls: Dict[str, str]) -> str:
+def resolve_bailii_case(s: requests.Session, title: str, citation: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Heuristic choice for the single CSV Url column, **without fetching**:
-    - If citation suggests Jersey reports (JLR/JRC/JCA/JCT), prefer JerseyLaw search.
-    - Otherwise prefer BAILII search.
-    - Fallback to DDG site:Bailii, then open search.
+    Return (case_page_url, search_url). We hit sino_search_1 and then pick first result link.
     """
-    c = (citation or "").upper()
-    looks_jersey = any(tok in c for tok in ("JLR", "JRC", "JCA", "JCT", "ROYAL COURT", "JERSEY"))
-    if looks_jersey and urls.get("jerseylaw_search"):
-        return urls["jerseylaw_search"]
-    if urls.get("bailii_search"):
-        return urls["bailii_search"]
-    if urls.get("ddg_site_bailii"):
-        return urls["ddg_site_bailii"]
-    if urls.get("ddg_open"):
-        return urls["ddg_open"]
-    # as a final fallback: try ddg site on jersey
-    if urls.get("ddg_site_jl"):
-        return urls["ddg_site_jl"]
-    return ""
+    qbits = [title.strip()]
+    if citation:
+        qbits.append(citation.strip())
+    q = " ".join(qbits)
 
+    search_u = bailii_search_url(q)
+    try:
+        r = s.get(search_u)
+        r.raise_for_status()
+    except Exception:
+        return (None, search_u)
 
-def read_cases_csv(path: str) -> Tuple[List[Dict[str, str]], List[str]]:
-    """
-    Read the input CSV. Accept common headings (case-insensitive):
-      - Title (required)
-      - Citation (optional)
-      - Year (optional)
-      - Line / Line_no (optional – we don’t use it here, but preserve for inspection if present)
+    soup = BeautifulSoup(r.text, "html.parser")
+    # BAILII lists results as numbered <a> links near the middle of the page.
+    # Grab first anchor that looks like a result (heuristic: contains a court/year path or ends with .html/.htm/.php)
+    link = None
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        text = " ".join(a.get_text(" ", strip=True).split())
+        if not href or "sino_search" in href.lower():
+            continue
+        if href.lower().endswith((".html", ".htm", ".php")) or "/ew/" in href.lower() or "/uk/" in href.lower() or "/je/" in href.lower():
+            link = absolute(search_u, href)
+            break
+    return (link, search_u)
 
-    Returns: (rows, normalized_header_list)
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Input CSV not found: {path}")
+# ----------- CSV I/O -----------
 
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        sniffer = csv.reader(f)
-        rows = list(sniffer)
+REQ_COLS_CASES = ("Title", "Citation")
 
-    if not rows:
-        return [], []
+def read_cases(input_csv: str, start: int, limit: int) -> list[Dict[str, str]]:
+    with open(input_csv, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        headers = [h.strip() for h in reader.fieldnames or []]
+        missing = [c for c in REQ_COLS_CASES if c not in headers]
+        if missing:
+            raise ValueError(f"{input_csv} missing columns: {missing}. Present: {headers}")
+        rows = list(reader)
+    end = len(rows) if limit <= 0 else min(len(rows), start + limit)
+    return rows[start:end]
 
-    header = rows[0]
-    data_rows = rows[1:]
+def write_preview_csv(out_path: str, rows: list[Dict[str, str]]):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["Title", "Citation", "url"])
+        w.writeheader()
+        for r in rows:
+            w.writerow({"Title": r.get("Title", ""),
+                        "Citation": r.get("Citation", ""),
+                        "url": r.get("url", "")})
 
-    # map header -> lowercase canonical
-    canon = [h.strip() for h in header]
-    lower = [h.lower() for h in canon]
+def write_json(path: str, obj: Dict):
+    import json
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
 
-    def get(row: List[str], key_variants: List[str]) -> str:
-        for kv in key_variants:
-            if kv in lower:
-                idx = lower.index(kv)
-                if idx < len(row):
-                    return row[idx]
-        return ""
+# ----------- main -----------
 
-    out: List[Dict[str, str]] = []
-    for r in data_rows:
-        title = get(r, ["title"])
-        citation = get(r, ["citation"])
-        year = get(r, ["year"])
-        line_no = get(r, ["line", "line_no", "source_line"])
-        out.append({
-            "Title": title,
-            "Citation": citation,
-            "Year": year,
-            "Line": line_no,
-        })
+def enrich_block(input_csv: str, outdir: str, start: int, limit: int,
+                 sleep_min: float, sleep_max: float, abort_after: int) -> None:
+    s = _session()
+    cases = read_cases(input_csv, start, limit)
+    enriched: list[Dict[str, str]] = []
+    urls_debug: Dict[int, Dict[str, Optional[str]]] = {}
+    skipped: Dict[int, Dict[str, str]] = {}
 
-    return out, canon
-
-
-# --------------------------
-# Main
-# --------------------------
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Preview enrichment (first N / window) with candidate URLs (no fetch).")
-    ap.add_argument("--input", required=True, help="Path to cases.csv (must contain Title column).")
-    ap.add_argument("--outdir", required=True, help="Directory to write preview artifacts into.")
-    ap.add_argument("--start", type=int, default=0, help="Start row index (0-based).")
-    ap.add_argument("--limit", type=int, default=10, help="Max rows to process from start.")
-    ap.add_argument("--sleep-min", type=float, default=0.0, help="Min sleep between rows (seconds).")
-    ap.add_argument("--sleep-max", type=float, default=0.0, help="Max sleep between rows (seconds).")
-    ap.add_argument("--abort-after", type=int, default=8, help="Abort after N consecutive failures.")
-    args = ap.parse_args()
-
-    src = args.input
-    outdir = args.outdir
-    os.makedirs(outdir, exist_ok=True)
-
-    # Output files
-    cases_out = os.path.join(outdir, "cases_preview.csv")
-    urls_out = os.path.join(outdir, "urls_preview.json")
-    skipped_out = os.path.join(outdir, "skipped_preview.json")
-
-    rows, header = read_cases_csv(src)
-
-    if not rows:
-        print("No rows in input CSV; nothing to do.", flush=True)
-        # still create empty artifacts so user sees them
-        with open(cases_out, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["Title", "Citation", "Url"])
-            writer.writeheader()
-        json.dump({}, open(urls_out, "w", encoding="utf-8"), indent=2)
-        json.dump({}, open(skipped_out, "w", encoding="utf-8"), indent=2)
-        return 0
-
-    start = max(0, args.start)
-    end = len(rows) if args.limit <= 0 else min(len(rows), start + args.limit)
-    window = rows[start:end]
-
-    print(f"Processing {len(window)} cases starting from row {start}", flush=True)
-
-    results: List[Dict[str, str]] = []
-    urls_index: Dict[str, Dict[str, str]] = {}
-    skipped: Dict[str, Dict[str, str]] = {}
-
+    n = len(cases)
     ok = 0
-    ko = 0
     consec_fail = 0
     t0 = time.time()
 
-    for i, row in enumerate(window, 1):
-        title = norm(row.get("Title", ""))
-        citation = norm(row.get("Citation", ""))
-        # safety: bail if no title
-        if not title:
-            ko += 1
-            consec_fail += 1
-            skipped_key = str(start + (i - 1))
-            skipped[skipped_key] = {"title": title, "reason": "no-title"}
-            # heartbeat
-            elapsed = max(1e-6, time.time() - t0)
-            rate = (ok + ko) / elapsed
-            print(f"[{i}/{len(window)}] SKIP (no title) | ok:{ok} skip:{ko} | {rate:.2f} cases/s", flush=True)
-            if consec_fail >= args.abort_after:
-                print(f"!! aborting: {consec_fail} consecutive failures (max {args.abort_after})", flush=True)
-                break
-            continue
+    print(f"Processing {n} cases starting from row {start}")
+    for i, row in enumerate(cases, start=1):
+        title = (row.get("Title") or "").strip()
+        citation = (row.get("Citation") or "").strip()
 
+        # Heartbeat line
+        rate = (ok / max(1.0, (time.time() - t0)))
+        print(f"[{i}/{n}] Processing: {title[:92]} | ok={ok} | {rate:.2f} cases/s")
+
+        candidate_urls: Dict[str, Optional[str]] = {"jlib_case": None, "bailii_case": None,
+                                                    "jlib_search": None, "bailii_search": None}
+
+        # 1) JLIB (Jersey)
         try:
-            query = build_query(title, citation)
-            if not query:
-                raise ValueError("empty-query")
+            case_u, search_u = resolve_jlib_case(s, title, citation)
+            candidate_urls["jlib_case"] = case_u
+            candidate_urls["jlib_search"] = search_u
+        except Exception:
+            pass
 
-            u = {
-                "jerseylaw_search": jerseylaw_search(query),
-                "bailii_search": bailii_search(query),
-                "ddg_site_jl": ddg_site(query, "jerseylaw.je"),
-                "ddg_site_bailii": ddg_site(query, "bailii.org"),
-                "ddg_open": ddg_open(query),
-            }
-            primary = choose_primary(title, citation, u)
+        # 2) BAILII
+        try:
+            case_u, search_u = resolve_bailii_case(s, title, citation)
+            candidate_urls["bailii_case"] = case_u
+            candidate_urls["bailii_search"] = search_u
+        except Exception:
+            pass
 
-            # save candidates for inspection
-            urls_index[str(start + (i - 1))] = {
-                "title": title,
-                "year": row.get("Year", ""),
-                "citation": citation,
-                "query": query,
-                "urls": u,
-                "primary_suggested": primary,
-            }
+        best = pick_best_url(candidate_urls)
+        urls_debug[i] = {"title": title, "citation": citation, **candidate_urls, "primary_suggested": best}
 
-            results.append({
-                "title": title,
-                "citation": citation,
-                "url": primary,
-            })
-
+        if best:
+            enriched.append({"Title": title, "Citation": citation, "url": best})
             ok += 1
             consec_fail = 0
-
-        except Exception as e:
-            ko += 1
+        else:
+            skipped[i] = {"title": title, "citation": citation, "reason": "no-verified-match"}
             consec_fail += 1
-            skipped_key = str(start + (i - 1))
-            skipped[skipped_key] = {"title": title, "reason": str(e)}
 
-            if consec_fail >= args.abort_after:
-                print(f"!! aborting: {consec_fail} consecutive failures (max {args.abort_after})", flush=True)
-                break
+        # Abort if too many consecutive failures
+        if consec_fail >= abort_after:
+            print(f"!! aborting: {consec_fail} consecutive failures (max {abort_after})")
+            break
 
-        # heartbeat
-        elapsed = max(1e-6, time.time() - t0)
-        rate = (ok + ko) / elapsed
-        print(f"[{i}/{len(window)}] case {start + (i - 1)} | ok:{ok} skip:{ko} | {rate:.2f} cases/s | title='{title[:80]}'", flush=True)
+        sleep_jitter(sleep_min, sleep_max)
 
-        # gentle pacing (optional)
-        sleep_jitter(args.sleep_min, args.sleep_max)
+    # Persist preview files
+    write_preview_csv(os.path.join(outdir, "cases_preview.csv"), enriched)
+    write_json(os.path.join(outdir, "urls_preview.json"), urls_debug)
+    write_json(os.path.join(outdir, "skipped_preview.json"), skipped)
 
-    # --------------------------
-    # WRITE OUTPUT FILES
-    # --------------------------
-    with open(cases_out, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["Title", "Citation", "Url"])
-        writer.writeheader()
-        for r in results:
-            writer.writerow({
-                "Title": r.get("title", ""),
-                "Citation": r.get("citation", ""),
-                "Url": r.get("url", ""),
-            })
+    elapsed = time.time() - t0
+    print(f"Done. Success={ok}  Skipped={len(skipped)}  Elapsed={elapsed:.1f}s")
 
-    with open(urls_out, "w", encoding="utf-8") as f:
-        json.dump(urls_index, f, indent=2)
 
-    with open(skipped_out, "w", encoding="utf-8") as f:
-        json.dump(skipped, f, indent=2)
+def main():
+    ap = argparse.ArgumentParser(description="Enrich first N cases with real case-page URLs (preview only).")
+    ap.add_argument("--input", required=True, help="Path to data/cases.csv")
+    ap.add_argument("--outdir", required=True, help="Where to write preview artifacts")
+    ap.add_argument("--start", type=int, default=0, help="Row offset into CSV (default 0)")
+    ap.add_argument("--limit", type=int, default=10, help="How many rows to process (default 10)")
+    ap.add_argument("--sleep-min", type=float, default=1.8)
+    ap.add_argument("--sleep-max", type=float, default=3.6)
+    ap.add_argument("--abort-after", type=int, default=8)
+    args = ap.parse_args()
 
-    print(f"Done. Success={ok}  Skipped={ko}  Elapsed={time.time()-t0:.1f}s", flush=True)
-    return 0
+    enrich_block(
+        input_csv=args.input,
+        outdir=args.outdir,
+        start=args.start,
+        limit=args.limit,
+        sleep_min=args.sleep_min,
+        sleep_max=args.sleep_max,
+        abort_after=args.abort_after,
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
