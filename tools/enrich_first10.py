@@ -1,14 +1,29 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-Create a small, safe preview:
-- Read data/cases.csv
-- Take first N rows with a non-empty Title
-- Build search URLs for JerseyLaw & BAILII (+ DuckDuckGo site queries)
-- Emit:
-  - out/preview-enrichment/cases_preview.csv   (Title,Citation,url)
-  - out/preview-enrichment/urls_preview.json   (per-row candidate links)
-  - out/preview-enrichment/skipped_preview.json (reasons for skip)
-Also prints a heartbeat every row so you can see progress in Actions logs.
+Enrich the first N cases from data/cases.csv:
+- Build conservative search queries (Title + optional Citation year).
+- Try JerseyLaw and Bailii search URLs for transparency.
+- Also fetch the Bailii search result page and pick a direct document URL if found.
+- Write:
+  out/preview-enrichment/urls_preview.json
+  out/preview-enrichment/skipped_preview.json
+  out/preview-enrichment/cases_preview.csv
+
+This script is intentionally self-contained (no repo-local util imports) to avoid
+module path problems in Actions. It is *polite* (sleep+jitter) and aborts after
+a configurable number of consecutive misses so you can stop early if matching
+is failing.
+
+CLI:
+  python tools/enrich_first10.py \
+      --input data/cases.csv \
+      --outdir out/preview-enrichment \
+      --limit 10 \
+      --abort-after 6 \
+      --sleep-min 1.6 \
+      --sleep-max 2.6
 """
 
 import argparse
@@ -16,138 +31,202 @@ import csv
 import json
 import os
 import random
+import re
 import sys
 import time
-from urllib.parse import quote_plus
+from html import unescape
 
-def heartbeat(i, total, title, ok_count, skip_count, started_at):
-    elapsed = max(time.time() - started_at, 0.001)
-    rate = (i + 1) / elapsed
-    print(f"[hb] {i+1}/{total} | ok:{ok_count} skip:{skip_count} | {rate:0.2f} cases/s | title='{title[:80]}'", flush=True)
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except Exception as e:
+    print("Missing dependencies. Ensure 'requests' and 'beautifulsoup4' are installed.", file=sys.stderr)
+    raise
 
-def clean_title(raw):
-    if raw is None:
-        return ""
-    t = raw.strip()
-    # collapse repeated whitespace
-    t = " ".join(t.split())
-    # strip stray quotes
-    if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
-        t = t[1:-1].strip()
-    return t
+# ---------------------------------------------------------------------------
+# Helpers (self-contained)
+# ---------------------------------------------------------------------------
 
-def build_queries(title, citation):
-    """
-    We don’t hit the sites; we only construct *search* URLs that
-    a human (or a later scraper with a session) can click.
-    """
-    q_base = title
-    if citation:
-        q_full = f"{title} {citation}"
-    else:
-        q_full = title
+def sleep_jitter(min_s: float, max_s: float):
+    """Polite sleep with jitter."""
+    delay = random.uniform(min_s, max_s)
+    time.sleep(delay)
 
-    # Encode
-    q_title = quote_plus(q_base)
-    q_full_q = quote_plus(q_full)
+def safe_query(s: str) -> str:
+    """Very conservative query string to avoid over-aggressive quoting."""
+    s = s.strip()
+    # Collapse spaces
+    s = re.sub(r"\s+", " ", s)
+    # Remove trailing commas/semicolons/dangling punctuation
+    s = re.sub(r"[,\.;:\-–—\s]+$", "", s)
+    return s
+
+def extract_year_from_citation(cit: str) -> str | None:
+    if not cit:
+        return None
+    m = re.search(r"\[?(\d{4})\]?", cit)
+    return m.group(1) if m else None
+
+def build_queries(title: str, citation: str | None):
+    """Return a dict of search URLs and a primary suggestion (a Bailii query URL)."""
+    q_title = safe_query(title)
+    yr = extract_year_from_citation(citation or "")
+    q = q_title if not yr else f'{q_title} {yr}'
+
+    # JerseyLaw and Bailii search pages (not direct documents)
+    jersey_q = f'https://www.jerseylaw.je/search/Pages/results.aspx?k={requests.utils.quote(q)}'
+    bailii_q = f'https://www.bailii.org/cgi-bin/sino_search_1.cgi?query={requests.utils.quote(q)}'
+    # DDG fallbacks
+    ddg_site_jl   = f'https://duckduckgo.com/?q={requests.utils.quote(q + " site:jerseylaw.je")}'
+    ddg_site_bi   = f'https://duckduckgo.com/?q={requests.utils.quote(q + " site:bailii.org")}'
+    ddg_open      = f'https://duckduckgo.com/?q={requests.utils.quote(q)}'
 
     urls = {
-        # JerseyLaw’s site search (they recently changed some paths; this query falls back to /search)
-        "jerseylaw_search": f"https://www.jerseylaw.je/search/Pages/results.aspx?k={q_title}",
-        # BAILII title search (sino_search)
-        "bailii_search": f"https://www.bailii.org/cgi-bin/sino_search_1.cgi?query={q_full_q}",
-        # DuckDuckGo helpers with site filters
-        "ddg_site_jl": f"https://duckduckgo.com/?q={quote_plus(title)}+site%3Ajerseylaw.je",
-        "ddg_site_bailii": f"https://duckduckgo.com/?q={quote_plus(title)}+site%3Abailii.org",
-        "ddg_open": f"https://duckduckgo.com/?q={quote_plus(q_full)}",
+        "jerseylaw_search": jersey_q,
+        "bailii_search": bailii_q,
+        "ddg_site_jl": ddg_site_jl,
+        "ddg_site_bailii": ddg_site_bi,
+        "ddg_open": ddg_open,
     }
+    return urls, bailii_q
 
-    # A conservative "primary_suggested": prefer BAILII (widest coverage of UK cases),
-    # else JerseyLaw for Jersey cases; we can’t know jurisdiction yet, so default to BAILII.
-    urls["primary_suggested"] = urls["bailii_search"]
-    return urls
+def pick_bailii_doc_from_results(bailii_search_url: str, title: str, timeout=20) -> str | None:
+    """
+    Fetch Bailii search results and pick the most plausible document link.
+    Heuristics:
+      - Prefer links under /je/cases/ (Jersey) or /ew/cases/ etc. (UK) or /other-LLI paths.
+      - If nothing matches, return None (we do NOT fabricate).
+    """
+    try:
+        r = requests.get(bailii_search_url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        html = r.text
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Bailii lists results as <a href="/..."> within an ordered list or similar.
+        candidates = []
+        for a in soup.find_all("a", href=True):
+            href = unescape(a["href"])
+            # Normalize to absolute
+            if href.startswith("/"):
+                href = "https://www.bailii.org" + href
+            # Heuristic filters for judgments
+            if re.search(r"/(je|ew|uk|sc|ni|ie)/cases/", href, re.I) or "/jud" in href.lower():
+                # Light title check (loose)
+                candidates.append(href)
+
+        if candidates:
+            return candidates[0]  # first plausible document
+        return None
+    except requests.RequestException:
+        return None
+
+def write_json(path: str, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def append_csv(path: str, rows: list[tuple[str,str,str]]):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    header_needed = not os.path.exists(path)
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        if header_needed:
+            w.writerow(["Title", "Citation", "Url"])
+        for row in rows:
+            w.writerow(row)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="CSV with headers including Title and Citation")
-    ap.add_argument("--outdir", required=True, help="Output folder for artifacts")
-    ap.add_argument("--limit", type=int, default=10, help="How many rows to process")
-    ap.add_argument("--sleep-min", type=float, default=0.5)
-    ap.add_argument("--sleep-max", type=float, default=1.2)
-    ap.add_argument("--max-consec-fail", type=int, default=8)
+    ap.add_argument("--input", required=True, help="CSV with at least Title,Citation")
+    ap.add_argument("--outdir", required=True, help="Output folder for preview artifacts")
+    ap.add_argument("--limit", type=int, default=10, help="How many rows to process from the top")
+    ap.add_argument("--abort-after", type=int, default=6, help="Abort after this many consecutive misses")
+    ap.add_argument("--sleep-min", type=float, default=1.6)
+    ap.add_argument("--sleep-max", type=float, default=2.6)
     args = ap.parse_args()
 
-    os.makedirs(args.outdir, exist_ok=True)
+    in_csv  = args.input
+    outdir  = args.outdir
+    limit   = args.limit
+    max_fail= args.abort_after
 
-    rows = []
-    with open(args.input, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        # normalise headers (Title/Citation common in your file)
-        fieldnames = {k.lower(): k for k in reader.fieldnames or []}
-        get = lambda d, key: d.get(fieldnames.get(key, key), "").strip()
-        for r in reader:
-            title = clean_title(get(r, "title"))
-            citation = get(r, "citation")
-            if title:
-                rows.append({"title": title, "citation": citation})
+    urls_preview_path    = os.path.join(outdir, "urls_preview.json")
+    skipped_preview_path = os.path.join(outdir, "skipped_preview.json")
+    cases_preview_csv    = os.path.join(outdir, "cases_preview.csv")
 
-    total = min(args.limit, len(rows))
-    if total == 0:
-        print("No rows found with a non-empty Title.", file=sys.stderr)
-        sys.exit(1)
+    urls_preview = {}
+    skipped      = {}
+    consecutive_fail = 0
 
-    out_csv = os.path.join(args.outdir, "cases_preview.csv")
-    out_urls = os.path.join(args.outdir, "urls_preview.json")
-    out_skipped = os.path.join(args.outdir, "skipped_preview.json")
+    # Read input
+    with open(in_csv, "r", encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        rows = list(r)
 
-    ok = []
-    urls_blob = {}
-    skipped = {}
-    consec_fail = 0
-    start = time.time()
+    total = min(limit, len(rows))
+    print(f"[start] limit={limit} total_available={len(rows)} processing={total}")
 
-    for i in range(total):
-        title = rows[i]["title"]
-        citation = rows[i]["citation"]
-        try:
-            urls = build_queries(title, citation)
-            urls_blob[str(i)] = {
-                "title": title,
-                "year": "",          # (left blank until we parse it later)
-                "citation": citation or "",
-                "query": title if not citation else f"{title} {citation}",
-                "urls": urls,
+    written_rows: list[tuple[str,str,str]] = []
+
+    for idx in range(total):
+        row = rows[idx]
+        title = (row.get("Title") or row.get("title") or "").strip()
+        citation = (row.get("Citation") or row.get("citation") or "").strip()
+
+        hb = f"[{time.strftime('%H:%M:%S')}] case {idx+1}/{total}"
+        print(f"{hb} | title={title!r}")
+
+        if not title:
+            skipped[str(idx)] = {"title": title, "reason": "missing-title"}
+            consecutive_fail += 1
+            if consecutive_fail >= max_fail:
+                print(f"!! aborting: {consecutive_fail} consecutive failures (max {max_fail})")
+                break
+            continue
+
+        # Build queries and try to resolve a direct Bailii document link
+        url_set, bailii_search_url = build_queries(title, citation)
+        direct = pick_bailii_doc_from_results(bailii_search_url, title)
+
+        urls_preview[str(idx)] = {
+            "title": title,
+            "citation": citation,
+            "query": safe_query(f"{title} {citation}".strip()),
+            "urls": {
+                **url_set,
+                "primary_suggested": bailii_search_url,
+                "primary_doc": direct
             }
-            ok.append({
-                "Title": title,
-                "Citation": citation or "",
-                "url": urls["primary_suggested"],
-            })
-            consec_fail = 0
-        except Exception as e:
-            skipped[str(i)] = {"title": title, "reason": f"error: {e}"}
-            consec_fail += 1
-            if consec_fail >= args.max_consec_fail:
-                print(f"!! aborting: {consec_fail} consecutive failures (max {args.max_consec_fail})", file=sys.stderr)
+        }
+
+        if direct:
+            written_rows.append((title, citation, direct))
+            consecutive_fail = 0
+        else:
+            # Keep search URL as a fallback in the CSV so you can click *something*
+            written_rows.append((title, citation, bailii_search_url))
+            consecutive_fail += 1
+            if consecutive_fail >= max_fail:
+                print(f"!! aborting: {consecutive_fail} consecutive failures (max {max_fail})")
                 break
 
-        heartbeat(i, total, title, len(ok), len(skipped), start)
-        time.sleep(random.uniform(args.sleep_min, args.sleep_max))
+        # Polite pause
+        sleep_jitter(args.sleep_min, args.sleep_max)
 
-    # Write files
-    with open(out_urls, "w", encoding="utf-8") as f:
-        json.dump(urls_blob, f, ensure_ascii=False, indent=2)
+    # Persist outputs
+    if written_rows:
+        append_csv(cases_preview_csv, written_rows)
+        print(f"WROTE: {cases_preview_csv} ({len(written_rows)} rows)")
 
-    with open(out_skipped, "w", encoding="utf-8") as f:
-        json.dump(skipped, f, ensure_ascii=False, indent=2)
-
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["Title", "Citation", "url"])
-        w.writeheader()
-        for r in ok:
-            w.writerow(r)
-
-    print(f"Done. Success={len(ok)} Skipped={len(skipped)} Elapsed={time.time()-start:0.1f}s", flush=True)
+    write_json(urls_preview_path, urls_preview)
+    write_json(skipped_preview_path, skipped)
+    print(f"WROTE: {urls_preview_path}, {skipped_preview_path}")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
