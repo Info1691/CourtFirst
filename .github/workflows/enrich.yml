@@ -1,11 +1,32 @@
-name: Enrich one listing (single CSV)
+name: Enrich URLs for cases (DDG → JerseyLaw • BAILII)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      start_idx:
+        description: "Start row index (1-based, after header)"
+        required: false
+        default: "1"
+      end_idx:
+        description: "End row index (1-based, inclusive; 0 = to end)"
+        required: false
+        default: "0"
+      pause_secs:
+        description: "Seconds to sleep between lookups"
+        required: false
+        default: "2.2"
+      max_results:
+        description: "Max search results per query"
+        required: false
+        default: "6"
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Check out CourtFirst
         uses: actions/checkout@v4
@@ -13,27 +34,46 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install duckduckgo-search==6.1.6
 
-      - name: Prepare folders
-        run: mkdir -p out
-
-      - name: Enrich cases into ONE CSV
+      - name: Enrich with real URLs (JerseyLaw ▸ BAILII ▸ DDG)
         env:
           IN_CSV: data/cases.csv
-          OUT_DIR: out
+          OUT_CSV: data/cases.csv
+          ART_DIR: out/enriched
+          START_IDX: ${{ inputs.start_idx }}
+          END_IDX:   ${{ inputs.end_idx }}
+          RATE_LIMIT_SLEEP: ${{ inputs.pause_secs }}
+          MAX_RESULTS: ${{ inputs.max_results }}
+          MAX_RETRIES: "6"
+          HEARTBEAT_EVERY: "50"
         run: |
-          python tools/enrich_one_list.py
+          echo "::group::Enrich"
+          python tools/enrich_urls.py
+          echo "::endgroup::"
 
-      - name: Upload single listing
+      - name: Upload artifacts (CSV + reports)
         uses: actions/upload-artifact@v4
         with:
-          name: cases_enriched
+          name: enriched-${{ github.run_id }}
           path: |
-            out/cases_enriched.csv
-            out/run_report.json
+            data/cases.csv
+            out/enriched/*.json
+
+      - name: Commit updated CSV into CourtFirst
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/cases.csv out/enriched || true
+          if git diff --cached --quiet; then
+            echo "No CSV changes to commit."
+          else
+            git commit -m "Enrich: update URLs in data/cases.csv"
+            git push
+          fi
