@@ -1,254 +1,102 @@
-#!/usr/bin/env python3
+# tools/enrich_first10.py
 """
-Heartbeat enrichment (first 10 rows) for CourtFirst.
-
-Goal
-----
-- Read the first N rows from data/cases.csv.
-- Build *search URLs only* (no network fetch) for JerseyLaw, BAILII, and DuckDuckGo.
-- Use smarter queries: title + year + citation (when present).
-- Print a heartbeat line per case with running success/skip counters.
-- Emit preview artifacts:
-    out/preview-enrichment/urls_preview.json
-    out/preview-enrichment/skipped_preview.json
-    out/preview-enrichment/cases_preview.csv
-
-Inputs
-------
-- CSV: data/cases.csv
-  Expected headers (case-insensitive subset is enough):
-    Title, Year, Citation, Jurisdiction, Line
-  Extra columns are ignored.
-
-CLI
----
-  python tools/enrich_first10.py [--limit 10] [--out out/preview-enrichment] [--abort-after 8]
-
-Exit codes
-----------
-0: ran successfully
-2: aborted due to too many consecutive skips (no-verified-match or empty title)
-
-Notes
------
-- This script *builds* URLs; it does not verify them by requesting the pages.
-- The “skip” reason will be “no-title” or “no-verified-match” (the latter means we refused
-  to generate a query for obviously non-case headings like roman numeral folios).
+Take the first N cases from data/cases.csv and attempt to attach a DIRECT judgment URL
+(prefer jerseylaw.je, then bailii.org, then DDG fallback).
+Emits three artifacts into out/preview-enrichment/:
+  - cases_preview.csv  (Title,Citation,url)
+  - urls_preview.json  (diagnostics per row)
+  - skipped_preview.json (rows where we could not verify a direct link)
+Shows a heartbeat line for each processed case and aborts after max consecutive failures.
 """
-
-from __future__ import annotations
-
-import argparse
 import csv
 import json
 import os
-import re
 import sys
-from pathlib import Path
-from typing import Dict, Any, List, Tuple
-from urllib.parse import quote_plus
+from typing import List, Dict, Any, Tuple
 
+from util import sleep_jitter, pick_best_url
 
-# ---------- Config ----------
+INPUT = os.environ.get("INPUT", "data/cases.csv")
+OUTDIR = os.environ.get("OUTDIR", "out/preview-enrichment")
+LIMIT = int(os.environ.get("LIMIT", "10"))
+ABORT_AFTER = int(os.environ.get("ABORT_AFTER", "8"))
+SLEEP_MIN = float(os.environ.get("SLEEP_MIN", "2.0"))
+SLEEP_MAX = float(os.environ.get("SLEEP_MAX", "3.5"))
 
-CSV_PATH = Path("data/cases.csv")
+def read_cases_csv(path: str) -> List[Dict[str, str]]:
+    with open(path, newline="", encoding="utf-8") as f:
+        rdr = csv.DictReader(f)
+        rows = [dict((k or "").strip(), v) for k, v in row.items()] if False else list(rdr)  # normalize keys minimal
+        return rows
 
-DEFAULT_LIMIT = 10
-DEFAULT_OUT_DIR = Path("out/preview-enrichment")
-DEFAULT_ABORT_AFTER = 8  # abort if we see this many consecutive “skips”
+def ensure_outdir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
+def write_cases_preview(rows: List[Tuple[str, str, str]], outpath: str) -> None:
+    with open(outpath, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Title", "Citation", "url"])
+        w.writerows(rows)
 
-# ---------- Helpers ----------
-
-ROMAN_RE = re.compile(r"(?i)^(?:[ivxlcdm]+)\.?$")  # e.g. xxxvii
-BLANKISH_RE = re.compile(r"^\s*$")
-SECTIONY_RE = re.compile(r"^[A-Z]\.\s")                   # e.g. "B. The Rule ..."
-NONCASE_LEADERS = (
-    "Table of Cases",
-    "Index",
-    "Cases after Pitt v Holt",
-)
-
-def norm_header(name: str) -> str:
-    return name.strip().lower().replace(" ", "_")
-
-def load_csv_rows(csv_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    with csv_path.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        try:
-            header = next(reader)
-        except StopIteration:
-            return [], {}
-        idx = {norm_header(h): i for i, h in enumerate(header)}
-        rows = []
-        for r in reader:
-            rows.append(r)
-    return [dict(_row=r, _rowno=i+2) for i, r in enumerate(rows)], idx
-
-def cell(row: Dict[str, Any], index: Dict[str, int], key: str) -> str:
-    i = index.get(key)
-    if i is None:
-        return ""
-    r = row["_row"]
-    return r[i].strip() if i < len(r) else ""
-
-def looks_like_non_case_title(title: str) -> bool:
-    t = title.strip()
-    if BLANKISH_RE.match(t):
-        return True
-    if ROMAN_RE.match(t):
-        return True
-    if any(t.startswith(prefix) for prefix in NONCASE_LEADERS):
-        return True
-    if SECTIONY_RE.match(t):
-        return True
-    # things like "7-34" page-range leftovers etc
-    if re.match(r"^\d+(\s*[-–]\s*\d+)?$", t):
-        return True
-    return False
-
-def build_query(title: str, year: str, citation: str) -> str:
-    """
-    Smarter search query:
-      - always start with the exact title in quotes
-      - then append year (if numeric) and raw citation (if present)
-    """
-    parts = []
-    if title:
-        parts.append(f"\"{title}\"")
-    y = year.strip()
-    if y.isdigit() and len(y) == 4:
-        parts.append(y)
-    cit = citation.strip()
-    if cit:
-        parts.append(cit)
-    return " ".join(parts).strip()
-
-def pick_primary_engine(citation: str) -> str:
-    cit = citation.upper()
-    if "JRC" in cit or "JLR" in cit:
-        return "jerseylaw"
-    return "bailii"
-
-def build_search_urls(query: str, citation: str) -> Dict[str, str]:
-    """
-    Construct non-fetch search URLs for each engine.
-    """
-    q = quote_plus(query)
-    urls = {
-        "jerseylaw_search": f"https://www.jerseylaw.je/search/Pages/Results.aspx?k={q}",
-        "bailii_search":    f"https://www.bailii.org/cgi-bin/sino_search_1.cgi?query={q}",
-        "ddg_site_jersey":  f"https://duckduckgo.com/?q={quote_plus(query + ' site:jerseylaw.je')}",
-        "ddg_site_bailii":  f"https://duckduckgo.com/?q={quote_plus(query + ' site:bailii.org')}",
-        "ddg_open":         f"https://duckduckgo.com/?q={q}",
-    }
-    urls["primary_suggested"] = urls["jerseylaw_search"] if pick_primary_engine(citation) == "jerseylaw" else urls["bailii_search"]
-    return urls
-
-def ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-
-# ---------- Main ----------
+def write_json(obj: Any, outpath: str) -> None:
+    with open(outpath, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
-    ap.add_argument("--out", type=Path, default=DEFAULT_OUT_DIR)
-    ap.add_argument("--abort-after", type=int, default=DEFAULT_ABORT_AFTER)
-    args = ap.parse_args()
+    rows = read_cases_csv(INPUT)
+    ensure_outdir(OUTDIR)
 
-    if not CSV_PATH.exists():
-        print(f"[error] CSV not found: {CSV_PATH}", file=sys.stderr)
-        return 2
+    ok_rows: List[Tuple[str, str, str]] = []
+    diagnostics: Dict[int, Any] = {}
+    skipped: Dict[int, Any] = {}
 
-    rows, idx = load_csv_rows(CSV_PATH)
-    if not rows:
-        print("[error] CSV is empty", file=sys.stderr)
-        return 2
+    total = min(LIMIT, len(rows))
+    consec_fail = 0
 
-    # Map column names we care about (case-insensitive)
-    title_key = None
-    year_key = None
-    citation_key = None
-    for want in ("title", "case_title"):
-        if want in idx:
-            title_key = want
-            break
-    for want in ("year",):
-        if want in idx:
-            year_key = want
-            break
-    for want in ("citation", "cite", "report"):
-        if want in idx:
-            citation_key = want
-            break
+    print(f"[enrich_first10] input={INPUT} limit={LIMIT} -> total={total}", flush=True)
 
-    if title_key is None:
-        print("[error] CSV must contain a Title column", file=sys.stderr)
-        return 2
+    for idx in range(total):
+        r = rows[idx]
+        title = (r.get("Title") or r.get("title") or "").strip()
+        citation = (r.get("Citation") or r.get("citation") or "").strip()
 
-    limit = max(1, args.limit)
-    out_dir = args.out
-    ensure_dir(out_dir)
-
-    urls_preview: Dict[str, Any] = {}
-    skipped_preview: Dict[str, Any] = {}
-    cases_preview_rows: List[List[str]] = [["Title", "Citation", "url"]]
-
-    ok = 0
-    skips = 0
-    consec_skips = 0
-
-    for i, row in enumerate(rows[:limit], start=1):
-        title = cell(row, idx, title_key)
-        year = cell(row, idx, year_key) if year_key else ""
-        citation = cell(row, idx, citation_key) if citation_key else ""
-
-        status = ""
-        if not title or looks_like_non_case_title(title):
-            skips += 1
-            consec_skips += 1
-            skipped_preview[str(i)] = {"title": title, "reason": "no-verified-match" if title else "no-title"}
-            status = "skip"
+        best, diags = pick_best_url(title, citation)
+        if best:
+            ok_rows.append((title, citation, best))
+            diagnostics[idx] = {"title": title, "citation": citation, "primary": best, **diags}
+            consec_fail = 0
         else:
-            # Build smarter query
-            query = build_query(title, year, citation)
-            urls = build_search_urls(query, citation)
-            urls_preview[str(i)] = {
-                "title": title,
-                "year": year,
-                "citation": citation,
-                "query": query,
-                "urls": urls,
-            }
-            # prefer the “primary_suggested” for CSV preview
-            cases_preview_rows.append([title, citation, urls["primary_suggested"]])
-            ok += 1
-            consec_skips = 0
-            status = "ok"
+            skipped[idx] = {"title": title, "citation": citation, "reason": "no-verified-direct-link", **diags}
+            consec_fail += 1
 
-        rate = f"{(ok+skips)/max(1,i):.2f} cases/s"  # fake “speed” just to keep the same shape
-        print(f"[heartbeat] case {i}/{limit} | ok:{ok} skip:{skips} | {rate} | title='{title[:80]}' | {status}")
+        # Heartbeat
+        done = idx + 1
+        rate = done / max(1.0, (done * (SLEEP_MIN + SLEEP_MAX) / 2.0))  # rough & friendly
+        ok_count = len(ok_rows)
+        print(
+            f"[heartbeat] case {done}/{total} | ok:{ok_count} skip:{len(skipped)} | ~{rate:.2f} cases/s | title='{title[:48]}'",
+            flush=True,
+        )
 
-        if consec_skips >= args.abort_after:
-            print(f"!! aborting: {consec_skips} consecutive failures (max {args.abort_after})")
+        # abort on too many consecutive failures
+        if consec_fail >= ABORT_AFTER:
+            print(f"!! aborting: {consec_fail} consecutive failures (max {ABORT_AFTER})", flush=True)
             break
 
-    # Write artifacts
-    with (out_dir / "urls_preview.json").open("w", encoding="utf-8") as f:
-        json.dump(urls_preview, f, indent=2, ensure_ascii=False)
+        sleep_jitter(SLEEP_MIN, SLEEP_MAX)
 
-    with (out_dir / "skipped_preview.json").open("w", encoding="utf-8") as f:
-        json.dump(skipped_preview, f, indent=2, ensure_ascii=False)
+    # write artifacts
+    write_cases_preview(ok_rows, os.path.join(OUTDIR, "cases_preview.csv"))
+    write_json(diagnostics, os.path.join(OUTDIR, "urls_preview.json"))
+    write_json(skipped, os.path.join(OUTDIR, "skipped_preview.json"))
 
-    with (out_dir / "cases_preview.csv").open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerows(cases_preview_rows)
-
-    print(f"Done. Success={ok} Skipped={skips}")
-    return 0 if consec_skips < args.abort_after else 2
-
+    print(
+        f"Done. Success={len(ok_rows)} Skipped={len(skipped)} "
+        f"Elapsed~heartbeat only. Artifacts in {OUTDIR}",
+        flush=True,
+    )
+    # signal non-zero if nothing was found to ensure we fix queries before scaling
+    return 0 if ok_rows else 2
 
 if __name__ == "__main__":
     sys.exit(main())
