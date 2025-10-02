@@ -27,11 +27,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies (none strictly required)
+      - name: Install dependencies (requests, bs4, lxml, ddg)
         run: |
           python -V
           pip install --upgrade pip
-          pip install duckduckgo-search
+          pip install requests beautifulsoup4 lxml duckduckgo-search
 
       - name: Sanity check input exists
         run: |
