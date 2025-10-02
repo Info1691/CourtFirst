@@ -2,41 +2,71 @@ name: Extract Cases from LTJ.lines.json
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'tools/extract_cases_from_lines.py'
-      - 'LTJ-ui/out/LTJ.lines.json'
+    inputs:
+      ltj_ref:
+        description: "LTJ-ui ref (branch/tag/sha)"
+        default: "main"
+        required: true
+      start_line:
+        description: "Start line_no (inclusive) in LTJ.lines.json"
+        default: "1276"
+        required: true
+      end_line:
+        description: "End line_no (inclusive) in LTJ.lines.json"
+        default: "3083"
+        required: true
 
 jobs:
-  extract:
-    name: Build cases.csv from LTJ.lines.json
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - name: Checkout repository
+      - name: Check out CourtFirst (this repo)
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Check out LTJ-ui (private)
+        uses: actions/checkout@v4
         with:
-          python-version: '3.11'
+          repository: Info1691/LTJ-ui
+          token: ${{ secrets.LTJ_UI_TOKEN }}
+          ref: ${{ inputs.ltj_ref }}
+          path: LTJ-ui
 
-      - name: Install dependencies
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies (none strictly required)
         run: |
           python -m pip install --upgrade pip
 
       - name: Run extraction script
         run: |
           python tools/extract_cases_from_lines.py \
-            --input LTJ-ui/out/LTJ.lines.json \
+            --ltj-lines LTJ-ui/out/LTJ.lines.json \
             --out data/cases.csv \
-            --skip-report data/skip_report.json \
-            --start-line 1276 --end-line 3083
+            --start-line "${{ inputs.start_line }}" \
+            --end-line "${{ inputs.end_line }}"
 
-      - name: Upload artifacts (cases.csv + skip report)
-        uses: actions/upload-artifact@v4    # ✅ UPDATED HERE
+      - name: Upload artifacts (cases.csv)
+        uses: actions/upload-artifact@v4
         with:
-          name: extracted-cases
-          path: |
-            data/cases.csv
-            data/skip_report.json
+          name: cases.csv
+          path: data/cases.csv
+
+      - name: Commit results into CourtFirst
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/cases.csv
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update cases.csv via LTJ lines (lines ${{ inputs.start_line }}..${{ inputs.end_line }})"
+            git push
+          fi
