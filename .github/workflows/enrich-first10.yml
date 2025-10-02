@@ -1,7 +1,16 @@
-name: Enrich first 10 cases (preview + heartbeat)
+name: Enrich first N cases (preview + heartbeat)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Row to start from (0-based)"
+        required: false
+        default: "0"
+      limit:
+        description: "How many rows to preview/enrich"
+        required: false
+        default: "10"
 
 permissions:
   contents: read
@@ -18,35 +27,35 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install dependencies (none strictly required)
         run: |
           python -V
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install --upgrade pip
+          pip install duckduckgo-search
 
       - name: Sanity check input exists
         run: |
           test -f data/cases.csv || (echo "data/cases.csv not found" && exit 1)
           head -n 5 data/cases.csv || true
 
-      - name: Run first-10 enrichment (heartbeat enabled)
+      - name: Run enrichment preview (heartbeat enabled)
         env:
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          START: ${{ github.event.inputs.start }}
+          LIMIT: ${{ github.event.inputs.limit }}
         run: |
+          mkdir -p out/preview-enrichment
           python tools/enrich_first10.py \
-            --input data/cases.csv \
+            --start "${START:-0}" \
+            --limit "${LIMIT:-10}" \
             --outdir out/preview-enrichment \
-            --limit 10 \
-            --abort-after 6 \
-            --sleep-min 1.6 \
-            --sleep-max 2.6
+            --sleep-min 2.0 --sleep-max 3.5 --max-consec-fail 8
 
-      - name: Upload preview artifacts (unique name)
-        if: always()
+      - name: Upload preview artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: preview-enrichment-${{ github.run_id }}-${{ github.run_attempt }}
-          path: out/preview-enrichment/**
-          if-no-files-found: error
-          retention-days: 14
+          name: preview-enrichment
+          path: |
+            out/preview-enrichment/cases_preview.csv
+            out/preview-enrichment/urls_preview.json
+            out/preview-enrichment/skipped_preview.json
+          if-no-files-found: warn
