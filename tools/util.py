@@ -1,105 +1,133 @@
 # tools/util.py
-import csv, json, os, sys, time, math, random, pathlib
-from dataclasses import dataclass
-from typing import Iterable, Dict, Any, Optional, List, Tuple
-import urllib.parse as _u
-import urllib.request as _r
-import ssl
+import time
+import random
+import re
+from typing import Optional, Tuple, Dict, Any, List
+from urllib.parse import quote_plus, urljoin, urlparse
+import requests
+from bs4 import BeautifulSoup
 
-UA = "CourtFirstBot/1.0 (+https://github.com) python-urllib/3.x"
-CTX = ssl.create_default_context()
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+)
 
-def now_ts() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": UA, "Accept-Language": "en"})
 
-class Heartbeat:
-    """Periodically prints progress and writes a small on-disk heartbeat file."""
-    def __init__(self, total:int, every:int=25, out_dir:str="out", name:str="enrich"):
-        self.total = total
-        self.every = max(1, every)
-        self.out_dir = pathlib.Path(out_dir)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        self.name = name
-        self.done = 0
-        self.t0 = time.time()
-        self.file = self.out_dir / f"{name}_heartbeat.log"
+def sleep_jitter(min_s: float = 1.5, max_s: float = 3.5) -> None:
+    time.sleep(random.uniform(min_s, max_s))
 
-    def tick(self, delta:int=1):
-        self.done += delta
-        if self.done % self.every == 0:
-            elapsed = time.time() - self.t0
-            rate = self.done / max(1.0, elapsed)
-            msg = f"[{now_ts()}] {self.name}: {self.done}/{self.total} (~{rate:.2f}/s)"
-            print(msg, flush=True)
-            try:
-                self.file.write_text(msg + "\n", encoding="utf-8")
-            except Exception as e:
-                print(f"(heartbeat write failed: {e})", flush=True)
+def http_get(url: str, timeout: float = 20.0) -> requests.Response:
+    resp = SESSION.get(url, timeout=timeout, allow_redirects=True)
+    resp.raise_for_status()
+    return resp
 
-def read_csv(path:str) -> List[Dict[str,str]]:
-    rows=[]
-    with open(path, newline='', encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            rows.append({k:(v or "").strip() for k,v in row.items()})
-    return rows
+def norm_text(s: str) -> str:
+    return " ".join((s or "").split())
 
-def write_csv(path:str, rows:List[Dict[str,Any]], fieldnames:List[str]):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w=csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k:r.get(k,"") for k in fieldnames})
+_ROMAN_RE = re.compile(r"^(?ixv   # flags INSENSITIVE, VERBOSE via inline
+    [ivxlcdm]+   # roman numerals
+)$")
 
-def save_json(path:str, obj:Any):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+def is_roman_page_marker(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(_ROMAN_RE.match(s))
 
-def load_json(path:str, default:Any):
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    return default
+def build_ddg_html_url(query: str, site: Optional[str] = None) -> str:
+    # Use the no-JS HTML interface (no API keys, stable for scraping)
+    q = query
+    if site:
+        q = f'{query} site:{site}'
+    return f"https://duckduckgo.com/html/?q={quote_plus(q)}"
 
-def sleep_jitter(base:float=0.7, spread:float=0.6):
-    time.sleep(base + random.random()*spread)
-
-def http_get(url:str, timeout:float=30.0, headers:Optional[Dict[str,str]]=None) -> Tuple[int, bytes, Dict[str,str]]:
-    req=_r.Request(url, headers={"User-Agent":UA, **(headers or {})})
-    with _r.urlopen(req, timeout=timeout, context=CTX) as resp:
-        status=resp.status
-        data=resp.read()
-        hdrs={k.lower():v for k,v in resp.headers.items()}
-        return status, data, hdrs
-
-def try_get(url:str, retries:int=3, backoff:float=1.5) -> Optional[str]:
-    for i in range(retries):
-        try:
-            status, data, _ = http_get(url)
-            if 200 <= status < 300:
-                return data.decode("utf-8", "replace")
-        except Exception as e:
-            pass
-        sleep_jitter(backoff*(i+1), 0.3)
+def first_link_from_ddg_html(query: str, prefer_domains: List[str]) -> Optional[str]:
+    """
+    Scrape DuckDuckGo HTML results and return the first link whose domain is in prefer_domains.
+    """
+    url = build_ddg_html_url(query)
+    try:
+        resp = http_get(url)
+    except Exception:
+        return None
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for a in soup.select("a.result__a"):
+        href = a.get("href") or ""
+        # DDG HTML already gives direct destination links
+        netloc = urlparse(href).netloc.lower()
+        if any(netloc.endswith(d) for d in prefer_domains):
+            return href
     return None
 
-def ddg_search_url(query:str) -> str:
-    # Use HTML results page; we won’t parse DDG HTML here — we only record the search URL as a fallback
-    q=_u.quote_plus(query)
-    return f"https://duckduckgo.com/?q={q}"
+def resolve_bailii_from_search(query: str) -> Optional[str]:
+    """
+    Query Bailii's 'sino' search, then pull the first judgment link (not the sino_search page).
+    """
+    # Bailii 'sino' HTML search page – returns results we can parse.
+    search_url = f"https://www.bailii.org/cgi-bin/sino_search_1.cgi?query={quote_plus(query)}"
+    try:
+        resp = http_get(search_url)
+    except Exception:
+        return None
 
-def clean_title(title:str) -> str:
-    # drop trailing pinpoint page spans like “..., 12-45, 77-81”
-    if not title: return title
-    # keep commas in names; only strip trailing page-ranges block
-    return title.rstrip().rstrip(",").strip()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    # Target judgment links, which typically contain /cases/ or /jrc/ and are not another sino_search link.
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "sino_search" in href:
+            continue
+        if "/cases/" in href or "/jrc/" in href or href.endswith(".html"):
+            return urljoin("https://www.bailii.org/", href)
+    return None
 
-def build_queries(title:str, citation:str, jurisdiction:str) -> List[str]:
-    t=clean_title(title)
-    c=(citation or "").strip()
-    j=(jurisdiction or "").strip()
-    base=[t]
-    if c: base.append(f"{t} {c}")
-    if j: base.append(f"{t} {j}")
-    return list(dict.fromkeys([q for q in base if q]))  # dedupe, keep order
+def resolve_jerseylaw_from_search(query: str) -> Optional[str]:
+    """
+    JerseyLaw recently moved off the old Results.aspx; the site search works at /search?q=.
+    We open the HTML and pick the first link pointing into /judgments/ or /judgments/unreported/ or /jrc/.
+    """
+    # site search results (HTML)
+    search_url = f"https://www.jerseylaw.je/search?q={quote_plus(query)}"
+    try:
+        resp = http_get(search_url)
+    except Exception:
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    # Newer site uses result cards with links to judgments
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if any(seg in href for seg in ["/judgments/", "/judgments/unreported/", "/jrc/"]):
+            # Make absolute
+            return urljoin("https://www.jerseylaw.je", href)
+    return None
+
+def pick_best_url(title: str, citation: str) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Try JerseyLaw first (if likely Jersey), then Bailii, then DDG fallback.
+    Returns (best_url, diagnostics)
+    """
+    q_base = title
+    if citation:
+        q_base = f"{title} {citation}"
+
+    diags: Dict[str, Any] = {"query": q_base, "attempts": {}}
+
+    # 1) JerseyLaw
+    jl = resolve_jerseylaw_from_search(q_base)
+    diags["attempts"]["jerseylaw"] = jl
+    if jl:
+        return jl, diags
+
+    # 2) BAILII
+    bl = resolve_bailii_from_search(q_base)
+    diags["attempts"]["bailii"] = bl
+    if bl:
+        return bl, diags
+
+    # 3) DDG (prefer Jersey/Bailii)
+    ddg = first_link_from_ddg_html(q_base, prefer_domains=["jerseylaw.je", "bailii.org"])
+    diags["attempts"]["ddg"] = ddg
+    if ddg:
+        return ddg, diags
+
+    return None, diags
