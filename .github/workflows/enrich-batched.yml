@@ -3,115 +3,171 @@ name: Enrich URLs for cases (batched, polite)
 on:
   workflow_dispatch:
     inputs:
-      csv_path:
-        description: Path to cases CSV
-        required: true
-        default: data/cases.csv
-      batch_size:
-        description: Rows per batch (excl. header)
-        required: true
-        default: "500"
+      start_idx:
+        description: "Start row index (0-based, inclusive). Leave 0 to start at the top."
+        required: false
+        default: "0"
+      end_idx:
+        description: "End row index (0-based, exclusive). Leave empty to run to end."
+        required: false
+        default: ""
+      chunk_size:
+        description: "Rows per batch"
+        required: false
+        default: "400"
       sleep_min:
-        description: Min sleep seconds between queries
-        required: true
+        description: "Min seconds between lookups"
+        required: false
         default: "2.0"
       sleep_max:
-        description: Max sleep seconds between queries
-        required: true
+        description: "Max seconds between lookups"
+        required: false
         default: "4.0"
       max_retries:
-        description: Retries per URL lookup
-        required: true
+        description: "Max retries per query"
+        required: false
         default: "3"
+      emit_json:
+        description: "Also emit urls.json + fetch_report.json (true/false)"
+        required: false
+        default: "true"
+
+permissions:
+  contents: write
 
 jobs:
-  make-matrix:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.mkmatrix.outputs.matrix }}
-      batches: ${{ steps.mkmatrix.outputs.batches }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - id: mkmatrix
-        name: Build batch matrix from CSV
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const path = core.getInput('csv_path') || 'data/cases.csv';
-            const batchSize = parseInt(core.getInput('batch_size') || '500', 10);
-
-            if (!fs.existsSync(path)) {
-              core.setFailed(`CSV not found at ${path}`);
-              return;
-            }
-            // Count rows (minus header)
-            const lines = fs.readFileSync(path, 'utf8').trim().split(/\r?\n/);
-            const totalRows = Math.max(0, lines.length - 1);
-
-            function makeRanges(total, size) {
-              const out = [];
-              let start = 1; // 1-based data row index (excluding header)
-              while (start <= total) {
-                const end = Math.min(total, start + size - 1);
-                out.push({ start, end });
-                start = end + 1;
-              }
-              return out;
-            }
-
-            const ranges = makeRanges(totalRows, batchSize);
-            core.setOutput('matrix', JSON.stringify({ include: ranges }));
-            core.setOutput('batches', String(ranges.length));
-            core.notice(`Total data rows: ${totalRows}. Batches: ${ranges.length}.`);
-          result-encoding: string
-        env:
-          csv_path: ${{ github.event.inputs.csv_path }}
-          batch_size: ${{ github.event.inputs.batch_size }}
-
   enrich:
     runs-on: ubuntu-latest
-    needs: make-matrix
-    strategy:
-      # run BATCHES SEQUENTIALLY to avoid rate limits
-      max-parallel: 1
-      matrix: ${{ fromJson(needs.make-matrix.outputs.matrix) }}
+    timeout-minutes: 360
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repo (CourtFirst)
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests beautifulsoup4 pandas
 
-      - name: Enrich batch
-        env:
-          # pass inputs as env to keep CLI neat
-          CSV_PATH: ${{ github.event.inputs.csv_path }}
-          SLEEP_MIN: ${{ github.event.inputs.sleep_min }}
-          SLEEP_MAX: ${{ github.event.inputs.sleep_max }}
-          MAX_RETRIES: ${{ github.event.inputs.max_retries }}
+      - name: Sanity check files
         run: |
-          echo "::group::Enrich batch ${{ matrix.start }}..${{ matrix.end }}"
-          python tools/enrich_sources.py \
-            --input "${CSV_PATH}" \
-            --out   "${CSV_PATH}" \
-            --start ${{ matrix.start }} \
-            --end   ${{ matrix.end }} \
-            --sleep-min "${SLEEP_MIN}" \
-            --sleep-max "${SLEEP_MAX}" \
-            --max-retries "${MAX_RETRIES}"
-          echo "::endgroup::"
+          test -f tools/enrich_sources.py || (echo "tools/enrich_sources.py missing" && exit 1)
+          test -f data/cases.csv || (echo "data/cases.csv missing" && exit 1)
+          mkdir -p out/enriched
 
-      - name: Commit updated CSV (batch ${{ matrix.start }}..${{ matrix.end }})
-        uses: stefanzweifel/git-auto-commit-action@v5
+      - name: Compute batches
+        id: plan
+        shell: python
+        run: |
+          import os, json, pandas as pd
+          start_s = os.getenv("START_IDX", "0").strip()
+          end_s   = os.getenv("END_IDX", "").strip()
+          chunk_s = os.getenv("CHUNK_SIZE", "400").strip()
+
+          start = int(start_s or "0")
+          end   = None if end_s == "" else int(end_s)
+          chunk = max(1, int(chunk_s))
+
+          df = pd.read_csv("data/cases.csv")
+          total = len(df)
+
+          if end is None or end > total: end = total
+          if start < 0: start = 0
+          if start >= end:
+              batches = []
+          else:
+              batches = []
+              i = start
+              while i < end:
+                  j = min(i + chunk, end)
+                  batches.append([i, j])  # [start, endExclusive]
+                  i = j
+
+          plan = {
+              "total_rows": total,
+              "start": start,
+              "end": end,
+              "chunk_size": chunk,
+              "batches": batches
+          }
+          print("PLAN=", json.dumps(plan))
+          with open("out/enriched/plan.json","w") as f:
+              json.dump(plan, f, indent=2)
+          # expose as output
+          print(f"::set-output name=batches::{json.dumps(batches)}")
+
+        env:
+          START_IDX: ${{ inputs.start_idx }}
+          END_IDX:   ${{ inputs.end_idx }}
+          CHUNK_SIZE: ${{ inputs.chunk_size }}
+
+      - name: Run enrichment batches
+        # Use a little bash to iterate the JSON array from the previous step
+        run: |
+          set -euo pipefail
+          echo "Batches: ${{ steps.plan.outputs.batches }}"
+          python - <<'PY'
+          import json, os, subprocess, sys
+          from pathlib import Path
+
+          batches = json.loads(os.environ["BATCHES"])
+          if not batches:
+              print("No work planned (empty batches).")
+              sys.exit(0)
+
+          emit = os.environ.get("EMIT_JSON","true").lower() == "true"
+          sleep_min = os.environ.get("SLEEP_MIN","2.0")
+          sleep_max = os.environ.get("SLEEP_MAX","4.0")
+          max_retries = os.environ.get("MAX_RETRIES","3")
+
+          for k,(s,e) in enumerate(batches, start=1):
+              label = f"{s}..{e-1}"
+              print(f"\n=== Batch {k}/{len(batches)} :: rows {label} ===", flush=True)
+              cmd = [
+                  sys.executable, "tools/enrich_sources.py",
+                  "--input", "data/cases.csv",
+                  "--out",   "data/cases.csv",
+                  "--start", str(s),
+                  "--end",   str(e),
+                  "--sleep-min", sleep_min,
+                  "--sleep-max", sleep_max,
+                  "--max-retries", max_retries,
+                  "--batch-name", label
+              ]
+              if emit:
+                  cmd.append("--emit-json")
+              print("RUN:", " ".join(cmd), flush=True)
+              subprocess.run(cmd, check=True)
+          PY
+        env:
+          BATCHES: ${{ steps.plan.outputs.batches }}
+          SLEEP_MIN:  ${{ inputs.sleep_min }}
+          SLEEP_MAX:  ${{ inputs.sleep_max }}
+          MAX_RETRIES: ${{ inputs.max_retries }}
+          EMIT_JSON:  ${{ inputs.emit_json }}
+
+      - name: Upload artifacts (CSV + reports)
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          commit_message: "Enrich URLs batch ${{ matrix.start }}–${{ matrix.end }}"
-          file_pattern: ${{ github.event.inputs.csv_path }}
+          name: enrich-output-${{ github.run_id }}
+          path: |
+            data/cases.csv
+            out/enriched/**
+
+      - name: Commit updated CSV
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/cases.csv out/enriched || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Enrich URLs (batched polite): update cases.csv"
+            git push
+          fi
