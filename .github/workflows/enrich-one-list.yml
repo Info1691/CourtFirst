@@ -1,0 +1,41 @@
+name: Enrich one listing (strict, 5 rows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Start row (0-based)"
+        required: true
+        default: "0"
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: Run 5 rows with live progress
+        run: |
+          python tools/enrich_urls.py \
+            --input data/cases.csv \
+            --out data/cases.csv \
+            --start ${{ inputs.start }} --end $(( ${{ inputs.start }} + 5 )) \
+            --sleep-min 1.8 --sleep-max 3.2 \
+            --emit-json --batch-name "trial-5"
+
+      - name: Upload previews (CSV + JSON)
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-enrichment
+          path: out/preview-enrichment/*
