@@ -1,81 +1,42 @@
-name: Extract cases from LTJ lines
+name: Extract Cases from LTJ.lines.json
 
 on:
-  workflow_dispatch:
-    inputs:
-      start_line:
-        description: "Start line (inclusive) in LTJ lines"
-        required: true
-        default: "1276"
-      end_line:
-        description: "End line (inclusive) in LTJ lines"
-        required: true
-        default: "3083"
-      ltj_ref:
-        description: "LTJ-ui ref (branch/tag/SHA)"
-        required: true
-        default: "main"
-      lines_filename:
-        description: "File in LTJ-ui/out (LTJ.lines.json or LTK.lines.json)"
-        required: true
-        default: "LTJ.lines.json"
-
-permissions:
-  contents: write
-
-env:
-  OUT_CSV: data/cases.csv
+  workflow_dispatch:    # Manual trigger button in Actions tab
+  push:
+    paths:
+      - 'tools/extract_cases_from_lines.py'
+      - 'LTJ-ui/out/LTJ.lines.json'
 
 jobs:
-  build:
+  extract:
+    name: Build cases.csv from LTJ.lines.json
     runs-on: ubuntu-latest
+
     steps:
-      - name: Check out CourtFirst
-        uses: actions/checkout@v4
-        with:
-            fetch-depth: 0
-
-      - name: Make data folder
-        run: mkdir -p data
-
-      - name: Check out LTJ-ui (private, read-only)
-        uses: actions/checkout@v4
-        with:
-          repository: Info1691/LTJ-ui
-          ref: ${{ inputs.ltj_ref }}
-          token: ${{ secrets.LTJ_UI_TOKEN }}
-          path: ltj
-
-      - name: Verify LTJ lines file exists
-        id: lines
-        run: |
-          set -e
-          f="ltj/out/${{ inputs.lines_filename }}"
-          echo "file=$f" >> $GITHUB_OUTPUT
-          [[ -f "$f" ]] || { echo "::error::Missing $f"; exit 1; }
-          echo "Found $f"
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Extract and merge
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Run extraction script
         run: |
           python tools/extract_cases_from_lines.py \
-            --lines "${{ steps.lines.outputs.file }}" \
-            --start ${{ inputs.start_line }} \
-            --end ${{ inputs.end_line }} \
-            --out "${{ env.OUT_CSV }}"
+            --input LTJ-ui/out/LTJ.lines.json \
+            --out data/cases.csv \
+            --skip-report data/skip_report.json \
+            --start-line 1276 --end-line 3083
 
-      - name: Commit CSV
-        uses: stefanzweifel/git-auto-commit-action@v5
+      - name: Upload artifacts (cases.csv + skip report)
+        uses: actions/upload-artifact@v3
         with:
-          commit_message: "Extracted cases from LTJ lines ${{ inputs.start_line }}–${{ inputs.end_line }}"
-          file_pattern: data/cases.csv
-
-      - name: Upload CSV (artifact)
-        uses: actions/upload-artifact@v4
-        with:
-          name: cases.csv
-          path: data/cases.csv
+          name: extracted-cases
+          path: |
+            data/cases.csv
+            data/skip_report.json
