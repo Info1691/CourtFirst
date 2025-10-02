@@ -1,0 +1,49 @@
+name: Enrich first 10 cases (preview + heartbeat)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # needed for artifact upload (no code push here)
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repo (CourtFirst)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+            python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml
+
+      - name: Sanity check input exists
+        run: |
+          test -f data/cases.csv || { echo "data/cases.csv missing"; exit 1; }
+          head -n 3 data/cases.csv
+
+      - name: Run first-10 enrichment (heartbeat enabled)
+        run: |
+          python tools/enrich_first10.py \
+            --input data/cases.csv \
+            --outdir out/preview-enrichment \
+            --limit 10 \
+            --sleep-min 2.0 --sleep-max 3.5 \
+            --max-consec-fail 8
+
+      - name: Upload preview artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-enrichment
+          path: |
+            out/preview-enrichment/cases_preview.csv
+            out/preview-enrichment/urls_preview.json
+            out/preview-enrichment/skipped_preview.json
+          if-no-files-found: warn
