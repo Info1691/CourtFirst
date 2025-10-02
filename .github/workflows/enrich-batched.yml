@@ -2,46 +2,13 @@ name: Enrich URLs for cases (batched, polite)
 
 on:
   workflow_dispatch:
-    inputs:
-      start_idx:
-        description: "Start row index (0-based, inclusive). Leave 0 to start at the top."
-        required: false
-        default: "0"
-      end_idx:
-        description: "End row index (0-based, exclusive). Leave empty to run to end."
-        required: false
-        default: ""
-      chunk_size:
-        description: "Rows per batch"
-        required: false
-        default: "400"
-      sleep_min:
-        description: "Min seconds between lookups"
-        required: false
-        default: "2.0"
-      sleep_max:
-        description: "Max seconds between lookups"
-        required: false
-        default: "4.0"
-      max_retries:
-        description: "Max retries per query"
-        required: false
-        default: "3"
-      emit_json:
-        description: "Also emit urls.json + fetch_report.json (true/false)"
-        required: false
-        default: "true"
-
-permissions:
-  contents: write
 
 jobs:
   enrich:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
 
     steps:
-      - name: Check out repo (CourtFirst)
+      - name: Check out repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -49,125 +16,66 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 pandas
+          pip install requests beautifulsoup4
 
-      - name: Sanity check files
+      - name: Load row count
+        id: count
+        shell: bash
         run: |
-          test -f tools/enrich_sources.py || (echo "tools/enrich_sources.py missing" && exit 1)
-          test -f data/cases.csv || (echo "data/cases.csv missing" && exit 1)
-          mkdir -p out/enriched
+          ROWS=$(python - << 'PY'
+import csv
+import sys
+with open("data/cases.csv", newline="", encoding="utf-8") as f:
+    print(sum(1 for _ in csv.reader(f)) - 1)
+PY
+)
+          echo "rows=$ROWS" >> $GITHUB_OUTPUT
 
-      - name: Compute batches
-        id: plan
-        shell: python
+      - name: Compute batches (chunks of ~400)
+        id: batches
+        shell: bash
         run: |
-          import os, json, pandas as pd
-          start_s = os.getenv("START_IDX", "0").strip()
-          end_s   = os.getenv("END_IDX", "").strip()
-          chunk_s = os.getenv("CHUNK_SIZE", "400").strip()
-
-          start = int(start_s or "0")
-          end   = None if end_s == "" else int(end_s)
-          chunk = max(1, int(chunk_s))
-
-          df = pd.read_csv("data/cases.csv")
-          total = len(df)
-
-          if end is None or end > total: end = total
-          if start < 0: start = 0
-          if start >= end:
-              batches = []
-          else:
-              batches = []
-              i = start
-              while i < end:
-                  j = min(i + chunk, end)
-                  batches.append([i, j])  # [start, endExclusive]
-                  i = j
-
-          plan = {
-              "total_rows": total,
-              "start": start,
-              "end": end,
-              "chunk_size": chunk,
-              "batches": batches
-          }
-          print("PLAN=", json.dumps(plan))
-          with open("out/enriched/plan.json","w") as f:
-              json.dump(plan, f, indent=2)
-          # expose as output
-          print(f"::set-output name=batches::{json.dumps(batches)}")
-
-        env:
-          START_IDX: ${{ inputs.start_idx }}
-          END_IDX:   ${{ inputs.end_idx }}
-          CHUNK_SIZE: ${{ inputs.chunk_size }}
+          ROWS=${{ steps.count.outputs.rows }}
+          SIZE=400
+          STARTS=()
+          ENDS=()
+          i=0
+          while [ $i -lt $ROWS ]; do
+            STARTS+=($i)
+            j=$(( i + SIZE ))
+            if [ $j -gt $ROWS ]; then j=$ROWS; fi
+            ENDS+=($j)
+            i=$j
+          done
+          echo "starts=${STARTS[*]}" >> $GITHUB_OUTPUT
+          echo "ends=${ENDS[*]}" >> $GITHUB_OUTPUT
 
       - name: Run enrichment batches
-        # Use a little bash to iterate the JSON array from the previous step
+        shell: bash
         run: |
           set -euo pipefail
-          echo "Batches: ${{ steps.plan.outputs.batches }}"
-          python - <<'PY'
-          import json, os, subprocess, sys
-          from pathlib import Path
-
-          batches = json.loads(os.environ["BATCHES"])
-          if not batches:
-              print("No work planned (empty batches).")
-              sys.exit(0)
-
-          emit = os.environ.get("EMIT_JSON","true").lower() == "true"
-          sleep_min = os.environ.get("SLEEP_MIN","2.0")
-          sleep_max = os.environ.get("SLEEP_MAX","4.0")
-          max_retries = os.environ.get("MAX_RETRIES","3")
-
-          for k,(s,e) in enumerate(batches, start=1):
-              label = f"{s}..{e-1}"
-              print(f"\n=== Batch {k}/{len(batches)} :: rows {label} ===", flush=True)
-              cmd = [
-                  sys.executable, "tools/enrich_sources.py",
-                  "--input", "data/cases.csv",
-                  "--out",   "data/cases.csv",
-                  "--start", str(s),
-                  "--end",   str(e),
-                  "--sleep-min", sleep_min,
-                  "--sleep-max", sleep_max,
-                  "--max-retries", max_retries,
-                  "--batch-name", label
-              ]
-              if emit:
-                  cmd.append("--emit-json")
-              print("RUN:", " ".join(cmd), flush=True)
-              subprocess.run(cmd, check=True)
-          PY
-        env:
-          BATCHES: ${{ steps.plan.outputs.batches }}
-          SLEEP_MIN:  ${{ inputs.sleep_min }}
-          SLEEP_MAX:  ${{ inputs.sleep_max }}
-          MAX_RETRIES: ${{ inputs.max_retries }}
-          EMIT_JSON:  ${{ inputs.emit_json }}
+          mapfile -t STARTS < <(echo "${{ steps.batches.outputs.starts }}")
+          mapfile -t ENDS   < <(echo "${{ steps.batches.outputs.ends }}")
+          for idx in "${!STARTS[@]}"; do
+            S=${STARTS[$idx]}
+            E=${ENDS[$idx]}
+            echo ""
+            echo "=== Batch $((idx+1))/${#STARTS[@]} :: rows $S..$E ==="
+            python tools/enrich_urls.py \
+              --input data/cases.csv \
+              --out data/cases.csv \
+              --start "$S" --end "$E" \
+              --sleep-min 2.0 --sleep-max 4.0 \
+              --emit-json --batch-name "batch-$((idx+1))"
+          done
 
       - name: Upload artifacts (CSV + reports)
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: enrich-output-${{ github.run_id }}
+          name: enriched-cases
           path: |
             data/cases.csv
-            out/enriched/**
-
-      - name: Commit updated CSV
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/cases.csv out/enriched || true
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "Enrich URLs (batched polite): update cases.csv"
-            git push
-          fi
+            out/preview-enrichment/*
