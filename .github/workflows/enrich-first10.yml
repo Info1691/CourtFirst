@@ -1,19 +1,16 @@
+# .github/workflows/enrich-first10.yml
 name: Enrich first N cases (preview + heartbeat)
 
 on:
   workflow_dispatch:
     inputs:
-      start:
-        description: "Row offset to start (0-based)"
-        required: false
-        default: "0"
       limit:
-        description: "How many rows to process"
+        description: "How many rows to process from the top"
         required: false
         default: "10"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   enrich:
@@ -25,13 +22,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install dependencies (requests, bs4, lxml)
         run: |
           python -V
           pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install requests beautifulsoup4 lxml
 
       - name: Sanity check input exists
         run: |
@@ -40,19 +37,15 @@ jobs:
 
       - name: Run enrichment preview (heartbeat enabled)
         env:
-          START: ${{ inputs.start }}
-          LIMIT: ${{ inputs.limit }}
+          LIMIT: ${{ github.event.inputs.limit }}
         run: |
-          set -euo pipefail
           mkdir -p out/preview-enrichment
-          echo "::group::enrich"
           python tools/enrich_first10.py \
             --input data/cases.csv \
-            --outdir out/preview-enrichment \
-            --start "${START:-0}" \
-            --limit "${LIMIT:-10}" \
-            --sleep-min 2.0 --sleep-max 3.5 --abort-after 8
-          echo "::endgroup::"
+            --out data/cases.csv \
+            --limit ${LIMIT:-10} \
+            --sleep-min 1.8 --sleep-max 3.4 \
+            --outdir out/preview-enrichment
 
       - name: Upload preview artifacts
         uses: actions/upload-artifact@v4
@@ -62,4 +55,11 @@ jobs:
             out/preview-enrichment/cases_preview.csv
             out/preview-enrichment/urls_preview.json
             out/preview-enrichment/skipped_preview.json
-          if-no-files-found: error
+
+      - name: Commit updated CSV (first N rows only)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add data/cases.csv
+          git commit -m "Add direct case URLs for first N rows (preview run)" || echo "No changes"
+          git push
