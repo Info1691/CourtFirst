@@ -27,7 +27,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies (requests, bs4, lxml, ddg)
+      - name: Install dependencies
         run: |
           python -V
           pip install --upgrade pip
@@ -45,10 +45,13 @@ jobs:
         run: |
           mkdir -p out/preview-enrichment
           python tools/enrich_first10.py \
+            --input data/cases.csv \
+            --outdir out/preview-enrichment \
             --start "${START:-0}" \
             --limit "${LIMIT:-10}" \
-            --outdir out/preview-enrichment \
-            --sleep-min 2.0 --sleep-max 3.5 --max-consec-fail 8
+            --sleep-min 2.0 \
+            --sleep-max 3.5 \
+            --max-consec-fail 8
 
       - name: Upload preview artifacts
         uses: actions/upload-artifact@v4
