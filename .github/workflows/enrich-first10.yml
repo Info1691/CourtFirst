@@ -29,11 +29,10 @@ jobs:
           test -f data/cases.csv || (echo "data/cases.csv not found" && exit 1)
           mkdir -p out/preview-enrichment
 
-      # IMPORTANT: only use the args that enrich_first10.py actually supports.
-      # Positional LIMIT = 10, --out for output path, and --abort-after for early exit.
       - name: Run first-10 enrichment (heartbeat enabled)
         run: |
-          python tools/enrich_first10.py 10 \
+          python tools/enrich_first10.py \
+            --limit 10 \
             --out out/preview-enrichment/results.json \
             --abort-after 8
 
