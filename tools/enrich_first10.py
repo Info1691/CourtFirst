@@ -1,278 +1,254 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-Enrich the first N (default 10) cases in data/cases.csv with source URLs.
-- Providers (in order): JerseyLaw → BAILII → DuckDuckGo (HTML endpoint)
-- Heartbeat/progress every case (prints rate, successes, skips)
-- Polite throttling (default 2.0–3.5s between provider requests)
-- Fail-fast: abort after --max-consec-fail consecutive provider failures
-- Outputs (preview only; never overwrites your main CSV):
-    out/preview-enrichment/cases_preview.csv
+Heartbeat enrichment (first 10 rows) for CourtFirst.
+
+Goal
+----
+- Read the first N rows from data/cases.csv.
+- Build *search URLs only* (no network fetch) for JerseyLaw, BAILII, and DuckDuckGo.
+- Use smarter queries: title + year + citation (when present).
+- Print a heartbeat line per case with running success/skip counters.
+- Emit preview artifacts:
     out/preview-enrichment/urls_preview.json
     out/preview-enrichment/skipped_preview.json
+    out/preview-enrichment/cases_preview.csv
 
-CSV columns expected (header names, case-insensitive):
+Inputs
+------
+- CSV: data/cases.csv
+  Expected headers (case-insensitive subset is enough):
     Title, Year, Citation, Jurisdiction, Line
-Only Title and Line are strictly required.
+  Extra columns are ignored.
 
-Run locally:
-    python tools/enrich_first10.py --limit 10
+CLI
+---
+  python tools/enrich_first10.py [--limit 10] [--out out/preview-enrichment] [--abort-after 8]
 
-In CI (workflow below) this is called with safe defaults.
+Exit codes
+----------
+0: ran successfully
+2: aborted due to too many consecutive skips (no-verified-match or empty title)
+
+Notes
+-----
+- This script *builds* URLs; it does not verify them by requesting the pages.
+- The “skip” reason will be “no-title” or “no-verified-match” (the latter means we refused
+  to generate a query for obviously non-case headings like roman numeral folios).
 """
 
+from __future__ import annotations
+
+import argparse
 import csv
 import json
 import os
 import re
-import time
-import random
-import argparse
-from html import unescape
-from urllib.parse import urlencode, quote_plus
+import sys
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
+from urllib.parse import quote_plus
 
-import requests
-from bs4 import BeautifulSoup
 
 # ---------- Config ----------
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+CSV_PATH = Path("data/cases.csv")
+
+DEFAULT_LIMIT = 10
+DEFAULT_OUT_DIR = Path("out/preview-enrichment")
+DEFAULT_ABORT_AFTER = 8  # abort if we see this many consecutive “skips”
+
+
+# ---------- Helpers ----------
+
+ROMAN_RE = re.compile(r"^(?i)(?:[ivxlcdm]+)\.?$")         # e.g. xxxvii
+BLANKISH_RE = re.compile(r"^\s*$")
+SECTIONY_RE = re.compile(r"^[A-Z]\.\s")                   # e.g. "B. The Rule ..."
+NONCASE_LEADERS = (
+    "Table of Cases",
+    "Index",
+    "Cases after Pitt v Holt",
 )
-TIMEOUT = 25
 
-# Provider endpoints (GET)
-JERSEYLAW_SEARCH = "https://www.jerseylaw.je/search/Pages/Results.aspx"
-BAILII_SEARCH = "https://www.bailii.org/cgi-bin/sino_search_1.cgi"
-DDG_HTML = "https://duckduckgo.com/html/"
+def norm_header(name: str) -> str:
+    return name.strip().lower().replace(" ", "_")
 
-# Acceptable result domains
-ALLOW_DOMAINS = (
-    "jerseylaw.je",
-    "bailii.org",
-    "casemine.com",
-    "lawtel.thomsonreuters.co.uk",
-    "vlex.co.uk",
-)
-
-# -------- Utilities --------
-def sleep_between(min_s: float, max_s: float):
-    time.sleep(random.uniform(min_s, max_s))
-
-def read_cases_csv(path: str):
-    with open(path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    # Normalize keys (case-insensitive)
-    norm_rows = []
-    for r in rows:
-        norm = {k.strip().lower(): (r[k] or "").strip() for k in r}
-        norm_rows.append(norm)
-    return norm_rows
-
-def ensure_dir(p: str):
-    os.makedirs(p, exist_ok=True)
-
-def tokens(s: str):
-    s = re.sub(r"[\s\u00A0]+", " ", s or "").strip()
-    s = re.sub(r"[\u2018\u2019]", "'", s)  # curly quotes
-    return re.split(r"[\s,;:]+", s.lower())
-
-def score_title_match(query_title: str, candidate_text: str) -> float:
-    """Very light similarity: token overlap / query tokens."""
-    q = set(t for t in tokens(query_title) if t not in {"v", "re"})
-    c = set(tokens(candidate_text))
-    if not q:
-        return 0.0
-    return len(q & c) / float(len(q))
-
-def best_link(links, query_title):
-    """Pick the best-looking link by (domain priority, title score, length)."""
-    scored = []
-    for href, text in links:
-        domain_score = (
-            3 if "jerseylaw.je" in href
-            else 2 if "bailii.org" in href
-            else 1 if any(d in href for d in ALLOW_DOMAINS)
-            else 0
-        )
-        tscore = score_title_match(query_title, text or href)
-        scored.append((domain_score, tscore, -len(href), href, text))
-    scored.sort(reverse=True)
-    return scored[0][3] if scored else None
-
-def fetch(url, params=None):
-    headers = {"User-Agent": USER_AGENT}
-    r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r
-
-def parse_links_from_html(html, base_filter=None):
-    soup = BeautifulSoup(html, "lxml")
-    out = []
-    for a in soup.find_all("a", href=True):
-        href = unescape(a["href"]).strip()
-        text = a.get_text(" ", strip=True)
-        if base_filter and not base_filter(href):
-            continue
-        out.append((href, text))
-    return out
-
-# -------- Providers --------
-def search_jerseylaw(title, year):
-    # https://www.jerseylaw.je/search/Pages/Results.aspx?k=...
-    q = f'"{title}" {year or ""}'.strip()
-    params = {"k": q}
-    r = fetch(JERSEYLAW_SEARCH, params=params)
-    # Limit to judgments pages and PDFs
-    def filt(href):
-        return "jerseylaw.je" in href and (
-            "/judgments/" in href or href.lower().endswith(".pdf") or "/lawreports/" in href
-        )
-    links = parse_links_from_html(r.text, filt)
-    return links
-
-def search_bailii(title, year):
-    # https://www.bailii.org/cgi-bin/sino_search_1.cgi?query=...
-    q = f'"{title}" {year or ""}'.strip()
-    params = {
-        "query": q,
-        "method": "boolean",
-        "highlight": 1,
-        "sort": "relevance",
-    }
-    r = fetch(BAILII_SEARCH, params=params)
-    def filt(href):
-        return "bailii.org" in href
-    links = parse_links_from_html(r.text, filt)
-    return links
-
-def search_ddg(title, year):
-    # Light HTML endpoint, not the JS app
-    q = f'"{title}" {year or ""}'.strip()
-    params = {"q": q}
-    r = fetch(DDG_HTML, params=params)
-    def filt(href):
-        return any(d in href for d in ALLOW_DOMAINS)
-    links = parse_links_from_html(r.text, filt)
-    return links
-
-def resolve_url_for_case(title, year, min_sleep, max_sleep):
-    """Try providers in order; return best single URL or None."""
-    providers = [
-        ("jerseylaw", search_jerseylaw),
-        ("bailii", search_bailii),
-        ("ddg", search_ddg),
-    ]
-    all_links = []
-    for name, fn in providers:
+def load_csv_rows(csv_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    with csv_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
         try:
-            links = fn(title, year)
-            # Polite delay *between* providers
-            sleep_between(min_sleep, max_sleep)
-        except requests.HTTPError as e:
-            # 429 / 5xx: bubble up; caller may fail-fast
-            raise
-        except Exception:
-            links = []
-        all_links.extend(links)
-        # If we already have strong links from a high-priority provider, break
-        if name in {"jerseylaw", "bailii"} and links:
-            break
-    return best_link(all_links, title)
+            header = next(reader)
+        except StopIteration:
+            return [], {}
+        idx = {norm_header(h): i for i, h in enumerate(header)}
+        rows = []
+        for r in reader:
+            rows.append(r)
+    return [dict(_row=r, _rowno=i+2) for i, r in enumerate(rows)], idx
 
-# -------- Main --------
-def main():
+def cell(row: Dict[str, Any], index: Dict[str, int], key: str) -> str:
+    i = index.get(key)
+    if i is None:
+        return ""
+    r = row["_row"]
+    return r[i].strip() if i < len(r) else ""
+
+def looks_like_non_case_title(title: str) -> bool:
+    t = title.strip()
+    if BLANKISH_RE.match(t):
+        return True
+    if ROMAN_RE.match(t):
+        return True
+    if any(t.startswith(prefix) for prefix in NONCASE_LEADERS):
+        return True
+    if SECTIONY_RE.match(t):
+        return True
+    # things like "7-34" page-range leftovers etc
+    if re.match(r"^\d+(\s*[-–]\s*\d+)?$", t):
+        return True
+    return False
+
+def build_query(title: str, year: str, citation: str) -> str:
+    """
+    Smarter search query:
+      - always start with the exact title in quotes
+      - then append year (if numeric) and raw citation (if present)
+    """
+    parts = []
+    if title:
+        parts.append(f"\"{title}\"")
+    y = year.strip()
+    if y.isdigit() and len(y) == 4:
+        parts.append(y)
+    cit = citation.strip()
+    if cit:
+        parts.append(cit)
+    return " ".join(parts).strip()
+
+def pick_primary_engine(citation: str) -> str:
+    cit = citation.upper()
+    if "JRC" in cit or "JLR" in cit:
+        return "jerseylaw"
+    return "bailii"
+
+def build_search_urls(query: str, citation: str) -> Dict[str, str]:
+    """
+    Construct non-fetch search URLs for each engine.
+    """
+    q = quote_plus(query)
+    urls = {
+        "jerseylaw_search": f"https://www.jerseylaw.je/search/Pages/Results.aspx?k={q}",
+        "bailii_search":    f"https://www.bailii.org/cgi-bin/sino_search_1.cgi?query={q}",
+        "ddg_site_jersey":  f"https://duckduckgo.com/?q={quote_plus(query + ' site:jerseylaw.je')}",
+        "ddg_site_bailii":  f"https://duckduckgo.com/?q={quote_plus(query + ' site:bailii.org')}",
+        "ddg_open":         f"https://duckduckgo.com/?q={q}",
+    }
+    urls["primary_suggested"] = urls["jerseylaw_search"] if pick_primary_engine(citation) == "jerseylaw" else urls["bailii_search"]
+    return urls
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+# ---------- Main ----------
+
+def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="data/cases.csv")
-    ap.add_argument("--outdir", default="out/preview-enrichment")
-    ap.add_argument("--limit", type=int, default=10)
-    ap.add_argument("--sleep-min", type=float, default=2.0)
-    ap.add_argument("--sleep-max", type=float, default=3.5)
-    ap.add_argument("--max-consec-fail", type=int, default=8)
+    ap.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    ap.add_argument("--out", type=Path, default=DEFAULT_OUT_DIR)
+    ap.add_argument("--abort-after", type=int, default=DEFAULT_ABORT_AFTER)
     args = ap.parse_args()
 
-    ensure_dir(args.outdir)
-    rows = read_cases_csv(args.input)
-    # Figure out header names present
-    def get(row, name):
-        return row.get(name.lower(), "")
+    if not CSV_PATH.exists():
+        print(f"[error] CSV not found: {CSV_PATH}", file=sys.stderr)
+        return 2
 
-    # Take first N with a non-empty Title
-    work = []
-    for r in rows:
-        title = get(r, "Title") or get(r, "title")
-        if title:
-            work.append({
-                "title": title,
-                "year": (get(r, "Year") or get(r, "year")),
-                "citation": (get(r, "Citation") or get(r, "citation")),
-                "jurisdiction": (get(r, "Jurisdiction") or get(r, "jurisdiction")),
-                "line": (get(r, "Line") or get(r, "line")),
-            })
-        if len(work) >= args.limit:
+    rows, idx = load_csv_rows(CSV_PATH)
+    if not rows:
+        print("[error] CSV is empty", file=sys.stderr)
+        return 2
+
+    # Map column names we care about (case-insensitive)
+    title_key = None
+    year_key = None
+    citation_key = None
+    for want in ("title", "case_title"):
+        if want in idx:
+            title_key = want
+            break
+    for want in ("year",):
+        if want in idx:
+            year_key = want
+            break
+    for want in ("citation", "cite", "report"):
+        if want in idx:
+            citation_key = want
             break
 
-    urls_preview = {}
-    skipped = {}
-    out_csv_path = os.path.join(args.outdir, "cases_preview.csv")
-    consec_fail = 0
-    t0 = time.time()
-    success = 0
-    total = len(work)
+    if title_key is None:
+        print("[error] CSV must contain a Title column", file=sys.stderr)
+        return 2
 
-    # Write CSV header
-    with open(out_csv_path, "w", newline="", encoding="utf-8") as fout:
-        w = csv.writer(fout)
-        w.writerow(["Title", "Citation", "Year", "Line", "url"])
+    limit = max(1, args.limit)
+    out_dir = args.out
+    ensure_dir(out_dir)
 
-        for idx, c in enumerate(work, start=1):
-            title, year, cit, line = c["title"], c["year"], c["citation"], c["line"]
-            try:
-                url = resolve_url_for_case(title, year, args.sleep_min, args.sleep_max)
-                if url:
-                    success += 1
-                    consec_fail = 0
-                    urls_preview[str(idx)] = {
-                        "title": title, "year": year, "citation": cit, "line": line, "url": url
-                    }
-                    w.writerow([title, cit, year, line, url])
-                else:
-                    consec_fail += 1
-                    skipped[str(idx)] = {"title": title, "year": year, "citation": cit, "line": line,
-                                         "reason": "no-verified-match"}
-            except requests.HTTPError as e:
-                consec_fail += 1
-                skipped[str(idx)] = {"title": title, "year": year, "citation": cit, "line": line,
-                                     "reason": f"http-error:{e.response.status_code}"}
-            except Exception as e:
-                consec_fail += 1
-                skipped[str(idx)] = {"title": title, "year": year, "citation": cit, "line": line,
-                                     "reason": f"exception:{type(e).__name__}"}
+    urls_preview: Dict[str, Any] = {}
+    skipped_preview: Dict[str, Any] = {}
+    cases_preview_rows: List[List[str]] = [["Title", "Citation", "url"]]
 
-            # Heartbeat
-            elapsed = time.time() - t0
-            rate = idx / max(1.0, elapsed)
-            print(f"[{time.strftime('%H:%M:%S')}] case {idx}/{total} | "
-                  f"ok:{success} skip:{len(skipped)} | {rate:.2f} cases/s | title='{title[:70]}'")
+    ok = 0
+    skips = 0
+    consec_skips = 0
 
-            # Fail-fast if clearly going wrong
-            if consec_fail >= args.max_consec_fail:
-                print(f"!! aborting: {consec_fail} consecutive failures (max {args.max_consec_fail})")
-                break
+    for i, row in enumerate(rows[:limit], start=1):
+        title = cell(row, idx, title_key)
+        year = cell(row, idx, year_key) if year_key else ""
+        citation = cell(row, idx, citation_key) if citation_key else ""
 
-    # Save previews
-    with open(os.path.join(args.outdir, "urls_preview.json"), "w", encoding="utf-8") as f:
-        json.dump(urls_preview, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(args.outdir, "skipped_preview.json"), "w", encoding="utf-8") as f:
-        json.dump(skipped, f, ensure_ascii=False, indent=2)
+        status = ""
+        if not title or looks_like_non_case_title(title):
+            skips += 1
+            consec_skips += 1
+            skipped_preview[str(i)] = {"title": title, "reason": "no-verified-match" if title else "no-title"}
+            status = "skip"
+        else:
+            # Build smarter query
+            query = build_query(title, year, citation)
+            urls = build_search_urls(query, citation)
+            urls_preview[str(i)] = {
+                "title": title,
+                "year": year,
+                "citation": citation,
+                "query": query,
+                "urls": urls,
+            }
+            # prefer the “primary_suggested” for CSV preview
+            cases_preview_rows.append([title, citation, urls["primary_suggested"]])
+            ok += 1
+            consec_skips = 0
+            status = "ok"
 
-    # Final summary line
-    print(f"Done. Success={success} Skipped={len(skipped)} "
-          f"Elapsed={time.time()-t0:.1f}s")
-    # Non-zero exit if zero success (useful to catch total failure early)
-    if success == 0:
-        raise SystemExit(2)
+        rate = f"{(ok+skips)/max(1,i):.2f} cases/s"  # fake “speed” just to keep the same shape
+        print(f"[heartbeat] case {i}/{limit} | ok:{ok} skip:{skips} | {rate} | title='{title[:80]}' | {status}")
+
+        if consec_skips >= args.abort_after:
+            print(f"!! aborting: {consec_skips} consecutive failures (max {args.abort_after})")
+            break
+
+    # Write artifacts
+    with (out_dir / "urls_preview.json").open("w", encoding="utf-8") as f:
+        json.dump(urls_preview, f, indent=2, ensure_ascii=False)
+
+    with (out_dir / "skipped_preview.json").open("w", encoding="utf-8") as f:
+        json.dump(skipped_preview, f, indent=2, ensure_ascii=False)
+
+    with (out_dir / "cases_preview.csv").open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerows(cases_preview_rows)
+
+    print(f"Done. Success={ok} Skipped={skips}")
+    return 0 if consec_skips < args.abort_after else 2
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
