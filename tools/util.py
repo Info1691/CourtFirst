@@ -1,104 +1,117 @@
 # tools/util.py
-import time
-import random
-from typing import Optional, Tuple, Dict, Any, List
-from urllib.parse import quote_plus, urljoin, urlparse
-
+import csv, re, time, random, sys
+from typing import Dict, Optional, Tuple, Iterable, List
 import requests
 from bs4 import BeautifulSoup
 
-UA = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-)
+# --- HTTP helpers -------------------------------------------------------------
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": UA, "Accept-Language": "en"})
+def http_get(url: str, timeout: float = 30.0) -> Optional[str]:
+    try:
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0 CourtFirst/1.0"}, timeout=timeout)
+        if r.status_code == 200:
+            return r.text
+        return None
+    except Exception:
+        return None
 
-def sleep_jitter(min_s: float = 1.5, max_s: float = 3.5) -> None:
+def sleep_jitter(min_s: float = 1.2, max_s: float = 2.6) -> None:
     time.sleep(random.uniform(min_s, max_s))
 
-def http_get(url: str, timeout: float = 20.0) -> requests.Response:
-    resp = SESSION.get(url, timeout=timeout, allow_redirects=True)
-    resp.raise_for_status()
-    return resp
+# --- CSV helpers --------------------------------------------------------------
 
-def build_ddg_html_url(query: str, site: Optional[str] = None) -> str:
-    # DuckDuckGo HTML interface (no JS), easy to parse without API keys
-    q = query if not site else f"{query} site:{site}"
-    return f"https://duckduckgo.com/html/?q={quote_plus(q)}"
+def read_cases_csv(path: str) -> List[Dict[str,str]]:
+    with open(path, newline="", encoding="utf-8") as f:
+        rd = csv.DictReader(f)
+        rows = [dict(r) for r in rd]
+    return rows
 
-def first_link_from_ddg_html(query: str, prefer_domains: List[str]) -> Optional[str]:
-    """Return the first DDG result whose netloc ends with one of prefer_domains."""
-    url = build_ddg_html_url(query)
-    try:
-        resp = http_get(url)
-    except Exception:
-        return None
-    soup = BeautifulSoup(resp.text, "html.parser")
-    for a in soup.select("a.result__a"):
-        href = a.get("href") or ""
-        netloc = urlparse(href).netloc.lower()
-        if any(netloc.endswith(d) for d in prefer_domains):
-            return href
+def write_cases_csv(path: str, rows: Iterable[Dict[str,str]]) -> None:
+    rows = list(rows)
+    # Preserve fixed header order if possible
+    base = ["Title","Year","Citation","Jurisdiction","Line","url"]
+    # collect all keys
+    keys = list({k for r in rows for k in r.keys()})
+    # order: base first then the rest
+    header = [k for k in base if k in keys] + [k for k in keys if k not in base]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        wr = csv.DictWriter(f, fieldnames=header)
+        wr.writeheader()
+        for r in rows:
+            wr.writerow(r)
+
+def ensure_url_column(rows: List[Dict[str,str]]) -> None:
+    for r in rows:
+        if "url" not in r:
+            r["url"] = ""
+
+# --- URL picking --------------------------------------------------------------
+
+BAILII_CASE_RE = re.compile(r"https?://(?:www\.)?bailii\.org/.+?/cases?/.+\.html", re.I)
+BAILII_DB_RE   = re.compile(r"https?://(?:www\.)?bailii\.org/(?:databases|cgi-bin/sino_search)", re.I)
+
+JLIB_CASE_RE   = re.compile(r"https?://(?:www\.)?jerseylaw\.je/.+/judgments/.+", re.I)
+JLIB_SEARCH_RE = re.compile(r"https?://(?:www\.)?jerseylaw\.je/search/Pages/Results\.aspx", re.I)
+
+def is_real_case(url: str) -> bool:
+    u = url or ""
+    return bool(BAILII_CASE_RE.search(u) or JLIB_CASE_RE.search(u))
+
+def is_search(url: str) -> bool:
+    u = url or ""
+    return bool(BAILII_DB_RE.search(u) or JLIB_SEARCH_RE.search(u))
+
+def extract_first_case_from_html(html: str, domain: str) -> Optional[str]:
+    if not html: return None
+    soup = BeautifulSoup(html, "lxml")
+    anchors = soup.select("a[href]")
+    for a in anchors:
+        href = a.get("href","")
+        if domain == "bailii" and BAILII_CASE_RE.search(href):
+            return absolutize(href, "https://www.bailii.org")
+        if domain == "jlib" and JLIB_CASE_RE.search(href):
+            return absolutize(href, "https://www.jerseylaw.je")
     return None
 
-def resolve_bailii_from_search(query: str) -> Optional[str]:
-    """
-    Use BAILII's 'sino' HTML results, return the first *judgment* link (not a sino_search link).
-    """
-    search_url = f"https://www.bailii.org/cgi-bin/sino_search_1.cgi?query={quote_plus(query)}"
-    try:
-        resp = http_get(search_url)
-    except Exception:
-        return None
-    soup = BeautifulSoup(resp.text, "html.parser")
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        # Skip more search pages; prefer case/judgment pages
-        if "sino_search" in href:
-            continue
-        if "/cases/" in href or "/jrc/" in href or href.endswith(".html"):
-            return urljoin("https://www.bailii.org/", href)
-    return None
+def absolutize(href: str, base: str) -> str:
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    if href.startswith("/"):
+        return base.rstrip("/") + href
+    return base.rstrip("/") + "/" + href
 
-def resolve_jerseylaw_from_search(query: str) -> Optional[str]:
+def pick_best_url(urls: Dict[str, Optional[str]]) -> Tuple[str, Dict[str,str]]:
     """
-    JerseyLaw site search; pick the first link that looks like a judgment.
+    urls may contain:
+        jlib_case, jlib_search
+        bailii_case, bailii_search
+        primary_suggested (fallback)
+    Strategy:
+      1) prefer direct case links (JerseyLaw, then Bailii).
+      2) If only search links exist, fetch the search page and extract first case link.
+      3) Fallback to 'primary_suggested' if still nothing.
     """
-    search_url = f"https://www.jerseylaw.je/search?q={quote_plus(query)}"
-    try:
-        resp = http_get(search_url)
-    except Exception:
-        return None
-    soup = BeautifulSoup(resp.text, "html.parser")
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if any(seg in href for seg in ("/judgments/", "/judgments/unreported/", "/jrc/")):
-            return urljoin("https://www.jerseylaw.je", href)
-    return None
-
-def pick_best_url(title: str, citation: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    Prefer JerseyLaw, then BAILII, then DDG (filtered to those domains).
-    Returns (best_url, diagnostics).
-    """
-    q = f"{title} {citation}".strip()
-    diags: Dict[str, Any] = {"query": q, "attempts": {}}
-
-    jl = resolve_jerseylaw_from_search(q)
-    diags["attempts"]["jerseylaw"] = jl
-    if jl:
-        return jl, diags
-
-    bl = resolve_bailii_from_search(q)
-    diags["attempts"]["bailii"] = bl
-    if bl:
-        return bl, diags
-
-    ddg = first_link_from_ddg_html(q, prefer_domains=["jerseylaw.je", "bailii.org"])
-    diags["attempts"]["ddg"] = ddg
-    if ddg:
-        return ddg, diags
-
-    return None, diags
+    plan = {}
+    # 1) direct
+    for key in ("jlib_case","bailii_case"):
+        u = urls.get(key)
+        if u and is_real_case(u):
+            plan["decision"] = f"direct:{key}"
+            return u, plan
+    # 2) dereference search pages
+    for key, dom in (("jlib_search","jlib"), ("bailii_search","bailii")):
+        u = urls.get(key)
+        if u and is_search(u):
+            plan["decision"] = f"search:{key}"
+            html = http_get(u)
+            sleep_jitter(0.8, 1.6)
+            resolved = extract_first_case_from_html(html, dom)
+            if resolved:
+                plan["resolved_from"] = key
+                return resolved, plan
+    # 3) fallback
+    if urls.get("primary_suggested"):
+        plan["decision"] = "fallback:primary_suggested"
+        return urls["primary_suggested"], plan
+    plan["decision"] = "none"
+    return "", plan
