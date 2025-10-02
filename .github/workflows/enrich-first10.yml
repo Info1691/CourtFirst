@@ -9,7 +9,6 @@ permissions:
 jobs:
   enrich:
     runs-on: ubuntu-latest
-
     steps:
       - name: Check out repo (CourtFirst)
         uses: actions/checkout@v4
@@ -19,10 +18,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies (none strictly required)
+      - name: Install dependencies
         run: |
           python -V
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
 
       - name: Sanity check input exists
         run: |
@@ -30,24 +30,23 @@ jobs:
           head -n 5 data/cases.csv || true
 
       - name: Run first-10 enrichment (heartbeat enabled)
+        env:
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           python tools/enrich_first10.py \
             --input data/cases.csv \
             --outdir out/preview-enrichment \
             --limit 10 \
-            --sleep-min 0.5 --sleep-max 1.2 \
-            --max-consec-fail 8
+            --abort-after 6 \
+            --sleep-min 1.6 \
+            --sleep-max 2.6
 
-      - name: Show produced files
-        run: |
-          echo "== out/preview-enrichment =="
-          ls -lah out/preview-enrichment || true
-          echo "== Files should include cases_preview.csv, urls_preview.json, skipped_preview.json =="
-          echo "::notice title=Where are artifacts?::On the run page, scroll to the bottom to the **Artifacts** section (or tap the ••• menu on iPad and choose *Download artifacts*)."
-
-      - name: Upload artifacts (CSV + JSON)
+      - name: Upload preview artifacts (unique name)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: preview-enrichment
-          path: out/preview-enrichment/*
+          name: preview-enrichment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: out/preview-enrichment/**
           if-no-files-found: error
+          retention-days: 14
