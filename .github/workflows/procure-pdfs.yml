@@ -1,0 +1,76 @@
+name: Procure case PDFs (preview batch)
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Start row (0-based)"
+        required: false
+        default: "0"
+      limit:
+        description: "How many rows to process"
+        required: false
+        default: "25"
+
+permissions:
+  contents: write
+
+jobs:
+  procure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -V
+          pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml pdfminer.six
+
+      - name: Ensure reports dir
+        run: mkdir -p reports
+
+      - name: Apply manual overrides (if present)
+        run: |
+          if [ -f data/manual_overrides.csv ]; then \
+            python tools/apply_overrides.py --cases data/cases.csv --overrides data/manual_overrides.csv; \
+          else \
+            echo "No overrides file found; continuing."; \
+          fi
+
+      - name: Resolve PDF/page URLs (primary-first, with verified fallback)
+        run: |
+          python tools/resolve_pdfs.py \
+            --input data/cases.csv \
+            --out data/cases.csv \
+            --unresolved reports/unresolved.csv \
+            --start "${{ inputs.start }}" \
+            --limit "${{ inputs.limit }}"
+
+      - name: Fetch PDFs & extract text (cache/)
+        run: |
+          python tools/fetch_case_text.py --cases data/cases.csv --limit 50
+
+      - name: Upload artifacts (preview)
+        uses: actions/upload-artifact@v4
+        with:
+          name: procured-batch
+          path: |
+            data/cases.csv
+            reports/unresolved.csv
+            cache/pdfs
+            cache/text
+
+      - name: Commit updated cases.csv
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add data/cases.csv
+          git add reports/unresolved.csv || true
+          git commit -m "Procure PDFs batch (start=${{ inputs.start }}, limit=${{ inputs.limit }})" || echo "No changes"
+          git push
